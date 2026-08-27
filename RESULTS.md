@@ -203,6 +203,7 @@ Quality is **not** reported until the guardrails run. `n/a` means not yet measur
 | — | Baseline (unmodified, as shipped) | 1.00× | — | — | running | `bench/results/baseline/` |
 | 0.1 | **Freeze CLIP encoder** (`requires_grad_(False)`) | **1.36×** | n/a | n/a | verified, quality pending | `bench/results/freeze_clip.json` |
 | 0.2 | **Release the autograd graph each iteration** (`del sketches, losses_dict, loss`) | **1.34×** end-to-end (1.40× loop-only) | +0.0016 (noise floor ±0.013) | R@1 0.0%→0.0%, median rank 500→492 | **verified** | `bench/results/guardrails/guardrails_fixed_n16.json` |
+| **1.1** | **Batch the 3 seeds into one process** | **1.67×** (2.47× cumulative) | −0.0060 (i.e. slightly better) | median rank 525→397, R@10 0%→13.3% | **verified** | `bench/results/guardrails/guardrails_batched_n16.json` |
 
 ### 0.1 — Freeze the CLIP encoder (not in the brief's backlog)
 
@@ -323,6 +324,61 @@ displacement. The cause is diffvg's backward, which accumulates gradients with
 
 *Control is n=3; the ~48 vs ~54 px comparison is same-order rather than a tight bound.
 Widening it is cheap and worth doing before any change with a subtler expected effect.*
+
+
+### 1.1 — Batch the seeds (brief Tier 1, first entry)
+
+`bench/batch_seeds.py`. `run_object_sketching.py` spawns one **process** per seed over the
+same target. Each reloads RN101, ViT-B/32 (twice, inside `Painter`) and U2Net, recomputes
+the saliency map, then runs a 2001-iteration loop launching ~3800 kernels of ~5.5 µs. The
+profile says 41.6% of wall-clock is GPU-idle launch overhead, so three small launch-bound
+loops should become one larger one.
+
+**Shared:** model loading, target tensor, U2Net mask, and one CLIP encoder call over all
+seeds' views (15 sketch + 15 target images per iteration, instead of 3 × (5+5)).
+**Not shared, deliberately:** each seed keeps its own augmentation draws, and each seed's
+loss is reduced over only its own views before summing. The seeds have disjoint parameters,
+so `d(Σᵢ Lᵢ)/dθⱼ = dLⱼ/dθⱼ` — one backward gives every seed the gradient it would get
+alone, and one Adam over the concatenated parameters equals three separate Adams because
+Adam's state is per-parameter.
+
+**diffvg is not batched** — separate scenes cannot share a canvas, so rendering stays one
+call per seed. Only the CLIP half (57% of per-iteration cost) and startup amortise, which
+is why this lands at 1.67× rather than the brief's estimated 2–2.5×.
+
+#### Speedup ladder (n=16, 5 images × 3 seeds, all measured)
+
+| configuration | s/seed | cumulative | loss_eval | sd |
+|---|---:|---:|---:|---:|
+| baseline as shipped | 126.3 | 1.00× | 0.55880 | 0.03625 |
+| + no save logging (unpatched) | 117.7 | 1.07× | 0.55629 | 0.03503 |
+| + graph release 0.2 (full logging) | 94.2 | 1.34× | 0.56036 | 0.03713 |
+| + graph release 0.2 (no save logging) | 85.3 | 1.48× | 0.56085 | 0.03534 |
+| **+ batched seeds 1.1** | **51.1** | **2.47×** | 0.55487 | 0.03929 |
+
+Boot cost drops from ~9.1 s × 3 to **2.97 s shared**; loop cost from 42.5 to
+**~24.8 ms/iter/seed**.
+
+#### Equivalence, verified rather than assumed (`bench/verify_batched_equiv.py`)
+
+1. With N=1, `batched_conv_loss` reproduces `CLIPConvLoss.forward` **bit-identically** on
+   every loss term.
+2. Given the same augmented views, seed *i*'s loss inside the 15-row batch equals its loss
+   in its own 5-row batch **exactly (relative change 0.000e+00)**. BatchNorm is in eval
+   mode across all 106 layers, so the rows are genuinely independent.
+
+An earlier version of test 2 compared two RNG replays across differently shaped batches and
+reported deviations as large as the gradients themselves. That was a defect in the test, not
+the code — replaying augmentation draws across different batch shapes is not well defined.
+The rewritten test compares the quantity that actually matters.
+
+#### Quality
+
+Δ mean `loss_eval` = **−0.0060** (batched is marginally *better*), against a per-run
+nondeterminism floor of ±0.0128 (§4.3) and a between-seed sd of ±0.035 — comfortably inside
+the noise. Zero-shot 125-way is unchanged at 13.3%; retrieval median rank improves 525 → 397
+and R@10 0% → 13.3%. Trajectory divergence vs the per-process arm is 63.6 px, the same order
+as the 48.4 px the baseline shows against *itself*. Accepted.
 
 
 ---
