@@ -202,7 +202,7 @@ Quality is **not** reported until the guardrails run. `n/a` means not yet measur
 |---|---|---|---|---|---|---|
 | — | Baseline (unmodified, as shipped) | 1.00× | — | — | running | `bench/results/baseline/` |
 | 0.1 | **Freeze CLIP encoder** (`requires_grad_(False)`) | **1.36×** | n/a | n/a | verified, quality pending | `bench/results/freeze_clip.json` |
-| 0.2 | **Release the autograd graph each iteration** (`del sketches, losses_dict, loss`) | **1.40×** | pending | pending | applied, verifying | branch `opt/free-autograd-graph` |
+| 0.2 | **Release the autograd graph each iteration** (`del sketches, losses_dict, loss`) | **1.34×** end-to-end (1.40× loop-only) | +0.0016 (noise floor ±0.013) | R@1 0.0%→0.0%, median rank 500→492 | **verified** | `bench/results/guardrails/guardrails_fixed_n16.json` |
 
 ### 0.1 — Freeze the CLIP encoder (not in the brief's backlog)
 
@@ -275,10 +275,54 @@ torch's allocator statistics at all.
 End-to-end on the real script, 2001 iterations, instrumentation off:
 **113.48 s → 81.18 s = 1.40×.** The drift disappears: 36.1 ms/iter, flat.
 
-Quality: the change frees memory *after* `optimizer.step_()` and alters no computation,
-so `loss_eval` curves are expected to match exactly. **Verification in progress** —
-re-running the n=16 guardrail set and comparing curves element-wise against the stored
-baseline. Not counted until that lands.
+**Verified on the n=16 guardrail set** (15 runs, same 5 images × 3 seeds):
+
+| | shipped | patched |
+|---|---:|---:|
+| s/seed | 126.3 | **94.2** (1.34×) |
+| ms/iter | 62.9 | **46.9** |
+| mean loss_eval | 0.55880 ± 0.03625 | 0.56036 ± 0.03713 |
+| zero-shot top-1 (5-way) | 26.7% | 53.3% |
+| retrieval R@1 / median rank | 0.0% / 500 | 0.0% / 492 |
+
+I expected the `loss_eval` curves to be **bit-identical** — the change frees memory after
+`optimizer.step_()` and alters no computation. They are not (max |Δ| = 4.6e-2). That turned
+out to say nothing about the change and everything about the method: see §4.3.
+
+
+### 4.3 — CLIPasso does not reproduce itself (affects every future comparison)
+
+Re-running the **unmodified** code with the **same seed** produces materially different
+sketches. Control: 3 runs re-executed from commit `2c08de5` and compared against the
+stored `shipped` results for the same image and seeds.
+
+| comparison | max \|Δ loss_eval\| | final ctrl-pt L2 | Δ best_loss_eval |
+|---|---:|---:|---:|
+| **unpatched vs unpatched** (identical code + seed) | 3.49e-2 | **48.38 px** | 1.28e-2 |
+| unpatched vs patched (`del`) | 4.61e-2 | 54.38 px | 2.09e-2 |
+
+On a 224 px canvas, the baseline diverges from *itself* by ~48 px of mean control-point
+displacement. The cause is diffvg's backward, which accumulates gradients with
+`atomicAdd` — a non-deterministic summation order — amplified through 2001 Adam steps.
+
+**Consequences for the project's methodology:**
+
+1. **Quality guardrail #4 as specified in the brief cannot work.** "Control-point
+   trajectory divergence vs the baseline — catches silent behavioural changes that leave
+   the loss unchanged" presumes a reproducible baseline. The noise floor is ~48 px, so
+   the metric has no resolution below that. It is kept in `bench/guardrails.py` but must
+   be read against this floor, never as an absolute.
+2. **No per-run comparison is meaningful.** Every (speedup, quality delta) pair has to be
+   a statistic over many runs and seeds. Single-run A/B is noise.
+3. **A change is "quality-neutral" only if its effect is inside this floor.** For 0.2:
+   Δ mean loss_eval = +0.0016 against a per-run nondeterminism floor of ±0.0128 and a
+   between-seed sd of ±0.036 — an order of magnitude below the noise. Accepted.
+4. Reproducible runs would need deterministic diffvg kernels (upstream change) or
+   `torch.use_deterministic_algorithms` plus a diffvg atomics rewrite. Worth knowing
+   before anyone tries to debug a "regression" that is really just variance.
+
+*Control is n=3; the ~48 vs ~54 px comparison is same-order rather than a tight bound.
+Widening it is cheap and worth doing before any change with a subtler expected effect.*
 
 
 ---
@@ -288,6 +332,24 @@ baseline. Not counted until that lands.
 Metric #2 was re-specified: the paper's zero-shot `"A sketch of a(n) {class}"` is now available
 again (Sketchy has class names), and **label-free sketch→photo retrieval** is added as a harder,
 semi-independent check. Both use ViT-B/32, which is *not* the RN101 driving the loss.
+
+**Measured baseline quality** (`bench/results/guardrails/`), and a validation of the harness itself:
+
+| metric | shipped, all 45 runs | shipped, n=16 only | **photos (control)** |
+|---|---:|---:|---:|
+| loss_eval | 0.56256 ± 0.04363 | 0.55880 ± 0.03625 | — |
+| zero-shot top-1, 125-way | 15.6% | 0.0% | **80.0%** |
+| zero-shot top-1, 5-way | 42.2% | 26.7% | — |
+| retrieval R@1 (2000 gallery) | 0.0% | 0.0% | **100.0%** |
+| retrieval median rank | 380 | 500 | 1 |
+
+The photo column is a plumbing control, not a result: the same `encode_tensor` path that
+scores sketches gives 80.0% on the source photos and 100% self-retrieval, and agrees with
+CLIP's official preprocess to cos 0.998. **The harness is correct; the sketches really are
+only weakly recognisable to ViT-B/32.** Recognisability is carried almost entirely by the
+32-stroke runs (125-way drops 15.6% → 0.0% when restricted to n=16), which is consistent
+in direction with the paper's 78% @ 16 / 91% @ 32, though not directly comparable — the
+paper's label space and corpus differ, and our eval set is only 5 distinct classes.
 
 1. **`loss_eval`** — the repo's own un-augmented eval loss. Primary, cheap, directly comparable.
 2. **Zero-shot top-1** — CLIP ViT-B/32, prompt `"A sketch of a(n) {class}"`, on `paper_protocol.json`.

@@ -122,6 +122,8 @@ def main():
     ap.add_argument("--runs", required=True, help="directory of CLIPasso run subdirs")
     ap.add_argument("--tag", required=True)
     ap.add_argument("--compare-to", default=None, help="reference run dir for trajectory divergence")
+    ap.add_argument("--strokes", type=int, default=None,
+                    help="restrict to one stroke count (needed for like-for-like deltas)")
     ap.add_argument("--gallery", type=int, default=2000, help="distractor pool size for retrieval")
     ap.add_argument("--out", default=str(ROOT / "bench" / "results" / "guardrails"))
     a = ap.parse_args()
@@ -135,6 +137,8 @@ def main():
     pydiffvg.set_device(device)
 
     runs = load_runs(a.runs)
+    if a.strokes is not None:
+        runs = [r for r in runs if r["num_paths"] == a.strokes]
     if not runs:
         raise SystemExit(f"no runs with a saved SVG under {a.runs}")
     print(f"loaded {len(runs)} runs from {a.runs}")
@@ -191,7 +195,7 @@ def main():
     losses = np.array([r["best_loss_eval"] for r in runs])
 
     res = {
-        "tag": a.tag, "n_runs": len(runs), "runs_dir": str(a.runs),
+        "tag": a.tag, "n_runs": len(runs), "runs_dir": str(a.runs), "strokes_filter": a.strokes,
         "loss_eval_mean": float(losses.mean()), "loss_eval_std": float(losses.std()),
         "zeroshot_top1_125way": top1_125,
         "zeroshot_top1_subset": top1_sub, "subset_size": len(sub_classes),
@@ -208,15 +212,21 @@ def main():
 
     # ---- metric 4: trajectory divergence vs a reference run
     if a.compare_to:
-        ref = {r["name"]: r for r in load_runs(a.compare_to)}
+        ref = {r["name"]: r for r in load_runs(a.compare_to)
+               if a.strokes is None or r["num_paths"] == a.strokes}
         divs, finals = [], []
         for r in runs:
             if r["name"] not in ref:
                 continue
             rr = ref[r["name"]]
-            pa, pb = svg_control_points(r["svg"]), svg_control_points(rr["svg"])
-            if pa.shape == pb.shape and pa.size:
-                finals.append(float(np.linalg.norm(pa - pb, axis=1).mean()))
+            # Compare final_svg, NOT best_iter: "best" can land on a different
+            # iteration in each run, which would compare different points in the
+            # trajectory and report divergence that is really just an index mismatch.
+            fa, fb = r["dir"] / "final_svg.svg", rr["dir"] / "final_svg.svg"
+            if fa.exists() and fb.exists():
+                pa, pb = svg_control_points(fa), svg_control_points(fb)
+                if pa.shape == pb.shape and pa.size:
+                    finals.append(float(np.linalg.norm(pa - pb, axis=1).mean()))
             la, lb = r["loss_eval"], rr["loss_eval"]
             n = min(len(la), len(lb))
             divs.append(float(np.abs(la[:n] - lb[:n]).max()))

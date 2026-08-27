@@ -33,6 +33,21 @@ PATCHES = [
         "(default is clip), so this is latent rather than fatal -- patched anyway.",
     ),
     (
+        "CLIP_/clip/auxilary.py",
+        """        attention_probs_forward_hook(attn_output_weights)
+        attn_output_weights.register_hook(attention_probs_backwards_hook)""",
+        """        attention_probs_forward_hook(attn_output_weights)
+        # [compat] The saliency path (interpret()) needs this backward hook, but the
+        # same ViT is also used for plain inference under torch.no_grad(), where
+        # register_hook() raises on a tensor that does not require grad. Guarding on
+        # requires_grad keeps the saliency behaviour identical and unblocks no_grad use.
+        if attn_output_weights.requires_grad:
+            attn_output_weights.register_hook(attention_probs_backwards_hook)""",
+        "register_hook() raises RuntimeError on tensors that don't require grad, so any "
+        "torch.no_grad() forward through the vendored ViT crashes. Blocks all ViT-B/32 "
+        "evaluation (quality guardrails 2 and 3).",
+    ),
+    (
         "sketch_utils.py",
         "net.load_state_dict(torch.load(model_dir))",
         "net.load_state_dict(torch.load(model_dir, weights_only=True))  # [compat] torch>=2.6 flipped weights_only default",
