@@ -1,3 +1,13 @@
 __pycache__/
 output_sketches/
 U2Net_/
+# --- speedup project ---
+.venv/
+third_party/
+data/
+bench/results/
+bench/logs/
+bench/smoke/
+output_sketches/
+U2Net_/saved_models/u2net.pth
+image_test/

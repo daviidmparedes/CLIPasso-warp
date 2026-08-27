@@ -263,7 +263,7 @@ def get_mask_u2net(args, pil_im):
     model_dir = os.path.join("./U2Net_/saved_models/u2net.pth")
     net = U2NET(3, 1)
     if torch.cuda.is_available() and args.use_gpu:
-        net.load_state_dict(torch.load(model_dir))
+        net.load_state_dict(torch.load(model_dir, weights_only=True))  # [compat] torch>=2.6 flipped weights_only default
         net.to(args.device)
     else:
         net.load_state_dict(torch.load(model_dir, map_location='cpu'))
