@@ -524,9 +524,10 @@ median rank, control-point trajectory divergence vs a reference run, and a conta
   Tier 1: the workload is launch-bound at every stroke count, so batching serves batch
   generation, interactive latency and a paper equally. The question only starts to bite
   when choosing between Tiers 2, 3 and 4.
-- **diffvg cannot be batched** — separate scenes cannot share a canvas. This caps 1.1 at
-  1.67× and will cap 1.2 the same way: only the CLIP half (57%) and startup amortise.
-  Any further large win on the vector side has to come from diffvg itself.
+- **diffvg cannot be batched** — separate scenes cannot share a canvas. This capped 1.1 at
+  1.67× and, as §1.2 then measured, capped 1.2 at 1.09×. Any further large win on the
+  vector side has to come from diffvg itself (see §7 P2, which proposes rendering many
+  scenes into one tiled raster so the launch cost is paid once).
 - **`diffvg bwd` is 21.9% of wall-clock**, the largest single phase, and has no entry in
   the brief's backlog.
 - Does the 41.6% launch idle survive `torch.compile` on the CLIP branch (1.3)? diffvg will
