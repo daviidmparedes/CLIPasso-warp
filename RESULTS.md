@@ -140,31 +140,58 @@ scene complexity. Two consequences: the 4/8/16/32 abstraction ladder is almost f
 and idea 2.3 (progressive stroke addition) cannot pay off through *fewer strokes* — only through
 faster convergence.
 
+### Per-iteration cost is flat across the run
+
+`python bench/profile_over_time.py` → `bench/results/profile/over_time_n16.json`
+
+A 50-iteration profile taken from initialisation could in principle understate diffvg,
+since strokes start as ~0.05-radius squiggles and lengthen as they fit the target.
+Measured at six checkpoints through a full 2001-iteration run, it does not:
+
+| iter | fused ms | diffvg | CLIP | ink coverage | ctrl-polygon len |
+|---:|---:|---:|---:|---:|---:|
+| 25 | 36.25 | 11.14 | 15.34 | 2.1% | 411 px |
+| 500 | 36.14 | 11.28 | 14.70 | 6.3% | 1492 px |
+| 1000 | 36.62 | 11.69 | 15.52 | 9.1% | 2208 px |
+| 1950 | 36.44 | 11.63 | 15.32 | 9.4% | 2911 px |
+
+**1.01× drift over the whole run**, while ink coverage rises 4.5× and control-polygon
+length 7×. Stroke growth is effectively free — consistent with the stroke-count sweep.
+The §2 breakdown is therefore representative of the entire run, not just its start.
+
 ---
 
 ## 3. Baseline (unmodified CLIPasso)
 
 `python bench/run_baseline.py` → `bench/results/baseline/baseline_shipped.json`
-Runs `painterly_rendering.py` as a subprocess exactly as `run_object_sketching.py` does, so
-timings include real process startup and model loading.
-
-Fixed eval set: 5 Sketchy images × {8,16,32} strokes × 3 seeds (0/1000/2000), `--num_iter 2001`.
-
-> **Status: running.** Preliminary single run (horse, n=16, seed 0):
-> **125.6 s/seed**, 62.5 ms/iter, 2010 iterations (no early stop), `loss_eval` 0.56613.
-
-> **Note the gap:** 62.5 ms/iter end-to-end vs **35.5 ms/iter** of actual optimisation (§2).
-> ~43% of baseline wall-clock is *not* optimisation — it is process startup plus the
-> `save_interval=10` logging (200 SVG writes + 200 matplotlib figures per run). The `nolog`
-> variant quantifies this separately.
+45/45 runs succeeded, **95.4 min** total. Fixed eval set: 5 Sketchy images ×
+{8,16,32} strokes × 3 seeds, `--num_iter 2001`.
 
 | n | s/seed | ms/iter | iters | early-stop % | mean loss_eval | ± | s/image (3 seeds) |
-|---|---|---|---|---|---|---|---|
-| 8 | _pending_ | | | | | | |
-| 16 | _pending_ | | | | | | |
-| 32 | _pending_ | | | | | | |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 122.1 | 60.7 | 2010 | **0%** | 0.59140 | 0.03055 | 366.2 |
+| 16 | 126.3 | 62.9 | 2010 | **0%** | 0.55880 | 0.03625 | 379.0 |
+| 32 | 133.2 | 66.2 | 2010 | **0%** | 0.53748 | 0.04460 | 399.5 |
 
----
+### The early-stopping rule never fires
+
+**0% of 45 runs stopped early.** The `min_delta=1e-5` criterion did not trigger once
+in 2001 iterations at any stroke count. Idea **2.1** therefore has the *entire*
+budget to cut into — the existing rule contributes nothing.
+
+### Wall-clock decomposition at n=16 (measured, not inferred)
+
+| component | s/seed | how measured |
+|---|---:|---|
+| fixed startup (imports, RN101 + ViT-B/32 + U2Net load, saliency init) | 9.1 | extrapolated from `--num_iter` 11 vs 111 |
+| optimisation loop | 104.4 | full run, all instrumentation disabled |
+| eval block (`eval_interval=10`) | 5.2 | eval on vs off, save off |
+| SVG + matplotlib logging (`save_interval=10`) | 8.7 | `shipped` vs `nolog` tags |
+| **total** | **126.3** | |
+
+An earlier estimate that "~43% of wall-clock is startup + logging" was **wrong**:
+logging is only 6.9% and startup 7.2%. The loop itself dominates — and §4.1 explains
+why it was slower than the profiler predicted.
 
 ## 4. (Speedup, quality delta) table
 
@@ -175,6 +202,7 @@ Quality is **not** reported until the guardrails run. `n/a` means not yet measur
 |---|---|---|---|---|---|---|
 | — | Baseline (unmodified, as shipped) | 1.00× | — | — | running | `bench/results/baseline/` |
 | 0.1 | **Freeze CLIP encoder** (`requires_grad_(False)`) | **1.36×** | n/a | n/a | verified, quality pending | `bench/results/freeze_clip.json` |
+| 0.2 | **Release the autograd graph each iteration** (`del sketches, losses_dict, loss`) | **1.40×** | pending | pending | applied, verifying | branch `opt/free-autograd-graph` |
 
 ### 0.1 — Freeze the CLIP encoder (not in the brief's backlog)
 
@@ -209,6 +237,50 @@ Mathematically exact (weight gradients cannot influence input gradients); numeri
 the method's existing fp16 noise floor. **Still must clear the §5 quality guardrails before it
 counts as free** — 2000 Adam steps can amplify small differences.
 
+### 0.2 — Release the per-iteration autograd graph (not in the brief's backlog)
+
+`painterly_rendering.py` binds `sketches`, `losses_dict` and `loss` in the enclosing
+loop scope, so they stay alive until they are **reassigned partway through the next
+iteration**. The previous iteration's autograd graph — including diffvg's
+`RenderFunction` context, which holds the serialized scene — is therefore still live
+while the next forward and backward run.
+
+This surfaced as a discrepancy, not a hunch: the in-process profiler measured
+36 ms/iter but a real 2001-iteration subprocess ran at 52 ms/iter, and the
+subprocess cost *drifted upward* (34.6 → 48.4 → 54.0 → 54.6 ms/iter) while the
+in-process loop stayed flat. Bisecting the two loop bodies isolated the difference to
+variable lifetime.
+
+Ruled out along the way, each by direct measurement: tqdm's per-iteration
+`epoch_range.refresh()` (113.79 s vs 113.48 s with `--display 1`), a missing
+per-iteration sync (52.11 vs 52.24 ms with an added `loss.item()`), and GPU thermal
+throttling (the in-process loop holds 36 ms under the same sustained load).
+
+The cost lands on exactly one phase (measured at iteration ~800):
+
+| phase | retaining | `del` |
+|---|---:|---:|
+| diffvg fwd | 4.36 ms | 3.61 ms |
+| CLIP fwd | 10.65 ms | 9.80 ms |
+| CLIP bwd | 5.99 ms | 5.70 ms |
+| **diffvg bwd** | **26.45 ms** | **7.74 ms** |
+
+**diffvg's backward pays a 3.4× penalty.** diffvg allocates outside PyTorch's caching
+allocator, so when its context is pinned by the retained graph it falls back to raw
+`cudaMalloc`/`cudaFree`, which synchronise. This also explains why
+`torch.cuda.max_memory_allocated` reports the *opposite* of the intuitive story
+(1716 MB retaining vs 1983 MB with `del`) — diffvg's allocations never appear in
+torch's allocator statistics at all.
+
+End-to-end on the real script, 2001 iterations, instrumentation off:
+**113.48 s → 81.18 s = 1.40×.** The drift disappears: 36.1 ms/iter, flat.
+
+Quality: the change frees memory *after* `optimizer.step_()` and alters no computation,
+so `loss_eval` curves are expected to match exactly. **Verification in progress** —
+re-running the n=16 guardrail set and comparing curves element-wise against the stored
+baseline. Not counted until that lands.
+
+
 ---
 
 ## 5. Quality guardrails
@@ -224,7 +296,16 @@ semi-independent check. Both use ViT-B/32, which is *not* the RN101 driving the 
 4. **Control-point trajectory divergence** vs baseline — catches behavioural changes the loss hides.
 5. **Visual contact sheet** — non-negotiable. Loss numbers hide perceptual failure, especially at 4 strokes.
 
-*(Not yet implemented — next task.)*
+Implemented in `bench/guardrails.py`:
+
+```
+python bench/guardrails.py --runs bench/results/baseline/shipped --tag shipped
+python bench/guardrails.py --runs bench/results/baseline/fixed_graphfree --tag fixed \
+                           --compare-to bench/results/baseline/shipped
+```
+
+Emits `loss_eval`, 125-way and subset zero-shot top-1, sketch→photo R@1/5/10 with
+median rank, control-point trajectory divergence vs a reference run, and a contact sheet.
 
 ---
 

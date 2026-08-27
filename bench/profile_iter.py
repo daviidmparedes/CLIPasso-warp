@@ -63,6 +63,15 @@ class PhaseTimer:
         self.rows.append(self.cur)
         self.cur = {}
 
+    def reset(self):
+        """Drop rows AND the partially-accumulated current row.
+
+        Clearing only .rows leaves .cur holding every un-flushed sub-timer call,
+        which then lands in the first measured row and poisons the means.
+        """
+        self.rows.clear()
+        self.cur = {}
+
     def stats(self):
         keys = sorted({k for r in self.rows for k in r})
         return {k: {
