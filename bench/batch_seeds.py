@@ -58,16 +58,20 @@ def cache_clip_load():
 
 
 def batched_conv_loss(cl, sketches, target, mode="train"):
-    """CLIPConvLoss over N sketches in ONE encoder call; returns a per-seed loss list.
+    """CLIPConvLoss over N sketches in ONE encoder call; returns a per-item loss list.
 
-    Mirrors CLIPConvLoss.forward exactly, except that the encoder sees all seeds'
-    views concatenated and each seed's reduction is taken over its own slice.
+    Mirrors CLIPConvLoss.forward exactly, except that the encoder sees all items'
+    views concatenated and each item's reduction is taken over its own slice.
+
+    `target` is either one tensor shared by every sketch (Tier 1.1, batching seeds of
+    a single image) or a list parallel to `sketches` (Tier 1.2, batching across images).
     """
     device = cl.device
-    y = target.to(device)
+    targets = target if isinstance(target, (list, tuple)) else [target] * len(sketches)
+    assert len(targets) == len(sketches), "targets must be parallel to sketches"
     xs_all, ys_all, counts = [], [], []
-    for x in sketches:
-        x = x.to(device)
+    for x, y in zip(sketches, targets):
+        x, y = x.to(device), y.to(device)
         sk, im = [cl.normalize_transform(x)], [cl.normalize_transform(y)]
         if mode == "train":
             for _ in range(cl.num_augs):

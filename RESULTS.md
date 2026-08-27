@@ -8,6 +8,42 @@ come from the harnesses, not from estimates.
 
 ---
 
+## Summary — current state
+
+**3.44× cumulative, no measurable quality cost**, on n=16 over the fixed 5-image eval set × 3 seeds.
+
+| # | change | marginal | cumulative | s/seed | quality |
+|---|---|---:|---:|---:|---|
+| — | baseline as shipped | — | 1.00× | 126.3 | — |
+| 0.2 | release the per-iteration autograd graph | 1.48× | 1.48× | 85.3 | inside noise floor |
+| 1.1 | batch the 3 seeds into one process | 1.67× | 2.47× | 51.1 | inside noise floor |
+| 0.1 + 0.3 | freeze the CLIP encoder + skip the unused `CLIPLoss` | 1.28× | 3.16× | 40.0 | inside noise floor |
+| 1.2 | batch across images (M=5) | 1.09× | **3.44×** | 36.7 | inside noise floor |
+
+Measured against the like-for-like unpatched arm (`nolog`, 117.7 s/seed) rather than the
+fully-logged default, the cumulative figure is **3.21×**. Both are stated because the
+default ships with logging on.
+
+Four findings that shaped everything after them:
+
+1. **The workload is launch-bound, not compute-bound.** 41.6% of wall-clock is GPU-idle,
+   ~3800 kernels/iteration averaging 5.5 µs. CLIP/diffvg is 1.37× — balanced, *not*
+   CLIP-dominated as the brief's prior expected. (§2)
+2. **CLIPasso does not reproduce itself.** Identical code, identical seed, run twice →
+   48 px mean control-point divergence on a 224 px canvas. This sets the noise floor for
+   every quality claim and invalidates guardrail #4 as the brief specifies it. (§4.3)
+3. **Three free speedups the brief's backlog never listed** (0.1, 0.2, 0.3), all found by
+   profiling rather than by working down the tier list. Together they are 1.90×.
+4. **diffvg does not batch, and that caps Tier 1.** Idea 1.2 was projected at 10–20×
+   throughput; it delivers **1.09×**. (§1.2)
+
+Corrections to earlier claims in this document, kept visible on purpose: an estimate that
+"~43% of wall-clock is startup + logging" was wrong (measured: 6.9% + 7.2%); a hypothesis
+that per-iteration cost grows as strokes lengthen was wrong (measured: 1.01× drift); and
+the brief's 10–20× estimate for 1.2 was wrong for a structural reason given below.
+
+---
+
 ## 0. Environment
 
 Built from scratch — the shipped stack (Python 3.7 / torch 1.7.1+cu101 / CUDA 11.0,
@@ -201,42 +237,44 @@ Quality is **not** reported until the guardrails run. `n/a` means not yet measur
 | # | Change | Speedup | Δ loss_eval | Δ retrieval | Status | Evidence |
 |---|---|---|---|---|---|---|
 | — | Baseline (unmodified, as shipped) | 1.00× | — | — | running | `bench/results/baseline/` |
-| 0.1 | **Freeze CLIP encoder** (`requires_grad_(False)`) | **1.36×** | n/a | n/a | verified, quality pending | `bench/results/freeze_clip.json` |
+| 0.1 | **Freeze the CLIP encoder** | **1.28×** with 0.3 | +0.0025 | median rank 397→395 | **verified** | `guardrails_batched_freeze_n16.json` |
+| 0.3 | **Skip the unused `CLIPLoss`** (`Loss.__init__`) | included in 0.1 row | none (never called) | — | **verified** | `models/loss.py` |
 | 0.2 | **Release the autograd graph each iteration** (`del sketches, losses_dict, loss`) | **1.34×** end-to-end (1.40× loop-only) | +0.0016 (noise floor ±0.013) | R@1 0.0%→0.0%, median rank 500→492 | **verified** | `bench/results/guardrails/guardrails_fixed_n16.json` |
-| **1.1** | **Batch the 3 seeds into one process** | **1.67×** (2.47× cumulative) | −0.0060 (i.e. slightly better) | median rank 525→397, R@10 0%→13.3% | **verified** | `bench/results/guardrails/guardrails_batched_n16.json` |
+| **1.1** | **Batch the 3 seeds into one process** | **1.67×** | −0.0060 (slightly better) | median rank 525→397 | **verified** | `guardrails_batched_n16.json` |
+| **1.2** | **Batch across images** (M=5 × 3 seeds) | **1.09×** — see §1.2 | +0.0046 | median rank 395→420 | **verified (mostly negative)** | `guardrails_tier12_M5_n16.json` |
 
-### 0.1 — Freeze the CLIP encoder (not in the brief's backlog)
+### 0.1 / 0.3 — Freeze the CLIP encoder, and stop building the loss nobody uses
 
-`models/loss.py` never sets `requires_grad=False` on the RN101 used for the perceptual loss.
-So **every** `loss.backward()` computes and accumulates weight gradients for **119.7 M
-parameters** in order to optimise **128** control points — 935,000× more gradient than needed.
-The optimiser only ever steps the points, so all of it is discarded.
+Two independent defects in `models/loss.py`, both now fixed in `CLIPConvLoss.__init__`
+and `Loss.__init__` so they hold for every entry point.
 
-`python bench/verify_freeze_clip.py`
+**0.1 — the encoder was never frozen.** `PainterOptimizer` only ever steps the Bézier
+control points, but nothing set `requires_grad=False` on RN101. Every `loss.backward()`
+therefore computed and accumulated weight gradients for **119.7 M parameters** in order to
+update **128** — 935,000× more gradient than needed, all discarded.
 
-| | as shipped | frozen |
-|---|---:|---:|
-| ms/iter | 35.84 | 25.85 |
-| peak alloc | 2757 MB | 2459 MB |
-| 2001-iter seed | 71.7 s | 52.8 s |
+**0.3 — `Loss.__init__` built both losses unconditionally**, so at default settings
+(`train_with_clip=0`) every process loaded a full ViT-B/32 for a `CLIPLoss` that is never
+called. Now only the selected losses are constructed, with lazy construction retained in
+`update_losses_to_apply` for the case where `clip` is appended mid-run. `Loss()`
+construction drops to **1.19 s**.
 
-**1.36× (26% of wall-clock removed), ~300 MB saved.**
+Measured together on top of 1.1, over the 5-image eval set × 3 seeds:
+**51.1 → 40.0 s/seed = 1.28×.**
 
-Numerical equivalence, checked carefully (this is *not* bit-identical, and the reason matters):
+Numerical equivalence was checked carefully, because freezing is *not* bit-identical:
 
 - Loss is **bit-identical** — the forward is untouched.
-- Point gradients differ by relL2 **1.4e-2**, against a run-to-run control of **1.3e-6**. Real, reproducible, confound-free (verified by toggling `requires_grad` within a single pipeline).
+- Point gradients differ by relL2 **1.4e-2** against a run-to-run control of 1.3e-6.
 - **Not** TF32 — identical delta with TF32 disabled.
-- **Cause: fp16.** OpenAI's `clip.load` converts weights to half on CUDA, so CLIPasso's whole
-  perceptual loss runs in fp16. Forcing fp32 collapses the frozen-vs-unfrozen delta to **8.2e-4**
-  (17× smaller) — a precision artifact from a different cuDNN backward algorithm, not a
-  semantic change.
-- **Context:** the baseline's own fp16 gradients differ from fp32 by relL2 **1.15e-1**. Freezing
-  perturbs the gradient **~8× less than the arithmetic CLIPasso already tolerates.**
+- **Cause: fp16.** OpenAI's `clip.load` converts weights to half on CUDA, so the whole
+  perceptual loss runs in fp16. Forcing fp32 collapses the delta 17× to **8.2e-4** — a
+  precision artifact from a different cuDNN backward algorithm, not a semantic change.
+- **Context:** the baseline's own fp16 gradients differ from fp32 by relL2 **1.15e-1**, so
+  freezing perturbs the gradient **~8× less than the arithmetic CLIPasso already tolerates.**
 
-Mathematically exact (weight gradients cannot influence input gradients); numerically within
-the method's existing fp16 noise floor. **Still must clear the §5 quality guardrails before it
-counts as free** — 2000 Adam steps can amplify small differences.
+End-to-end quality: Δ mean `loss_eval` **+0.0025** against the ±0.0128 noise floor (§4.3);
+zero-shot 125-way unchanged at 13.3%; retrieval median rank 397 → 395. Accepted.
 
 ### 0.2 — Release the per-iteration autograd graph (not in the brief's backlog)
 
@@ -381,6 +419,59 @@ and R@10 0% → 13.3%. Trajectory divergence vs the per-process arm is 63.6 px, 
 as the 48.4 px the baseline shows against *itself*. Accepted.
 
 
+### 1.2 — Batch across images (brief Tier 1) — **largely a negative result**
+
+`bench/batch_images.py`. Extends 1.1 from "N seeds of one image" to "N seeds of M images",
+all optimised concurrently with one CLIP encoder call per iteration over M·N·(1+A) sketch
+views and the matching target views. The equivalence argument and verification are the same
+as 1.1 (the shared `batched_conv_loss` was generalised to per-sketch targets and re-verified
+bit-identical).
+
+**The brief projected 10–20× throughput. Measured: 1.09×** (599.5 s → 551.2 s for
+5 images × 3 seeds, i.e. 40.0 → 36.7 s per sketch).
+
+#### Throughput saturates immediately
+
+201-iteration probe, 3 seeds per image:
+
+| M images | ms/iter | **ms/iter/sketch** | peak alloc |
+|---:|---:|---:|---:|
+| 1 | 55.6 | 18.5 | 1.80 GB |
+| 2 | 107.2 | 17.9 | 2.94 GB |
+| 5 | 267.0 | **17.8** | 6.38 GB |
+| 10 | 561.2 | 18.7 | 12.11 GB |
+| 16 | 936.3 | 19.5 | 18.95 GB |
+
+Per-sketch cost is flat, with a shallow optimum near M=5 and mild *regression* past M=10.
+Total time scales almost perfectly linearly (M=16 is 16.8× M=1), which means essentially
+nothing amortises beyond M=1. Memory is not the constraint — 19 GB of 97 GB at M=16.
+
+#### Why: diffvg does not batch
+
+Phase attribution at M=1 vs M=5 (25 measured iterations, synchronised boundaries):
+
+| phase | M=1 (3 sketches) | M=5 (15 sketches) | scaling for 5× work |
+|---|---:|---:|---:|
+| diffvg render | 9.84 ms | 60.42 ms | **6.1× (superlinear)** |
+| CLIP forward | 15.04 ms | 66.82 ms | 4.4× (sublinear — this part *does* amortise) |
+| backward | 28.02 ms | 133.85 ms | 4.8× |
+| **per sketch** | **17.88 ms** | **17.54 ms** | **1.02×** |
+
+The CLIP forward is the only phase that amortises, and its gain is cancelled by rendering,
+which scales *worse* than linearly. Separate scenes cannot share a canvas, so diffvg is
+called M·N times per iteration and its backward likewise. By M=5 the vector side is roughly
+60–70% of the iteration, and adding images adds it proportionally.
+
+**This caps Tier 1 as a whole.** The CLIP half was already saturated at M=1 (a 15-row
+encoder batch is enough to fill this GPU), so 1.1 captured nearly all the available
+amortisation and 1.2 has almost nothing left to take.
+
+Quality: Δ mean `loss_eval` **+0.0046** against the ±0.0128 noise floor; zero-shot 5-way
+unchanged at 46.7%; 125-way moved 13.3% → 6.7%, which on 15 runs is 2 correct vs 1 and is
+not a signal. Trajectory divergence 62.8 px vs the 48.4 px self-divergence floor. Accepted
+as neutral — it simply does not buy much.
+
+
 ---
 
 ## 5. Quality guardrails
@@ -429,9 +520,100 @@ median rank, control-point trajectory divergence vs a reference run, and a conta
 
 ## 6. Open questions
 
-- **§4 of the brief is unresolved** (deferred pending profile numbers — now available).
-  The profile argues the answer matters less than expected for Tier 1: the workload is
-  launch-bound at every stroke count, so batching helps *all three* goals.
-- Does the 41.6% launch idle survive `torch.compile` on the CLIP branch? diffvg will graph-break;
-  the question is whether the CLIP subgraph alone can be captured by CUDA graphs.
-- `diffvg bwd` at 21.9% is the largest single phase and has no entry in the brief's backlog.
+- **§4 of the brief remains formally open**, but the profile has largely defused it for
+  Tier 1: the workload is launch-bound at every stroke count, so batching serves batch
+  generation, interactive latency and a paper equally. The question only starts to bite
+  when choosing between Tiers 2, 3 and 4.
+- **diffvg cannot be batched** — separate scenes cannot share a canvas. This caps 1.1 at
+  1.67× and will cap 1.2 the same way: only the CLIP half (57%) and startup amortise.
+  Any further large win on the vector side has to come from diffvg itself.
+- **`diffvg bwd` is 21.9% of wall-clock**, the largest single phase, and has no entry in
+  the brief's backlog.
+- Does the 41.6% launch idle survive `torch.compile` on the CLIP branch (1.3)? diffvg will
+  graph-break; the question is whether the CLIP subgraph alone can be CUDA-graph captured.
+- **The early-stopping rule never fires** (0/45 runs), so idea 2.1 has the entire
+  2001-iteration budget available.
+- Reproducible runs would need deterministic diffvg kernels. Worth knowing before anyone
+  debugs a "regression" that is really variance.
+
+---
+
+## 7. What to do next
+
+Tier 1 is effectively exhausted: 1.1 captured nearly all available amortisation and 1.2
+proved there is little left (§1.2). The bottleneck has moved. Priorities below are ordered
+by evidence, not by the brief's tier numbering.
+
+### P1 — Idea 2.1, but measure *perceptual* saturation, not loss saturation (cheapest, do first)
+
+The early-stopping rule never fires (0/45 runs), so the whole 2001-iteration budget is
+available. But how much of it is dead weight is now quantifiable from the stored curves:
+
+| criterion | mean iter reached | median | p90 | implied speedup (p90) |
+|---|---:|---:|---:|---:|
+| within 5% of final best `loss_eval` | 470 | 430 | 744 | **2.7×** |
+| within 2% | 811 | 680 | 1472 | 1.4× |
+| within 1% | 1080 | 1070 | 1660 | 1.2× |
+
+Mean best iteration is 1230–1493 depending on stroke count. **This tempers the brief's
+"up to ~5×" estimate for 2.1**: on the raw objective, 5× would mean stopping around iter
+400, which costs well over 5% of final loss.
+
+The open question is whether *recognisability* saturates earlier than the loss does — the
+brief's Figure-7 intuition is about perceptual quality, not `loss_eval`. That is directly
+testable **with data already on disk**: the 45 `shipped` runs saved `svg_logs/svg_iter{k}.svg`
+every 10 iterations. Running `bench/guardrails.py` over those snapshots gives a
+quality-vs-iteration curve for zero-shot accuracy and retrieval rank with **zero new
+optimisation runs**. If recognisability plateaus at iter ~400 while loss keeps creeping,
+2.1 is worth 2.7–5×; if it tracks the loss, 2.1 is worth ~1.4× and should be de-prioritised.
+Do this before writing any new optimiser code.
+
+### P2 — Attack diffvg; it is now the bottleneck
+
+At M=5, rendering plus its share of backward is roughly 60–70% of each iteration, scales
+linearly with work, and amortises not at all. Nothing in the brief's backlog targets it.
+
+- **Tile the scenes onto one canvas.** M·N scenes cannot share a canvas *semantically*, but
+  they can share one *raster*: lay them out on a grid (e.g. 4×4 of 224², one 896² render),
+  call diffvg once, then slice. Rasterisation cost scales with area, but the ~3800-kernel
+  launch overhead is paid once instead of M·N times. This is the single most promising
+  untested idea, and it is a contained experiment.
+- **Reduce `num_samples_x/y` from 2 to 1** in `render_warp` — 4× fewer rasteriser samples.
+  Pure quality trade; measure with the guardrails.
+- **Profile diffvg's backward specifically.** It costs 2× its forward (7.77 vs 3.62 ms),
+  which is unusual and may indicate a fixable inefficiency rather than intrinsic cost.
+
+### P3 — Idea 1.3 (`torch.compile` / CUDA graphs on the CLIP branch), payoff now smaller
+
+Worth doing, but the profile has already devalued it. Batching absorbed much of the launch
+overhead the idea targets, and CLIP forward is now only ~25% of a batched iteration.
+Realistic expectation is ~1.1×, not the brief's 1.5–2×. diffvg will graph-break; the
+question is whether the CLIP subgraph alone can be CUDA-graph captured with static shapes.
+
+### P4 — Idea 1.4 (cache the augmented target), modest but it unlocks 2.4
+
+Measured ceiling was 9.6% of unbatched wall-clock (§2), lower than the brief's 1.4–1.8×
+estimate because the target branch is already `.detach()`ed — the waste is a redundant
+forward, not a forward+backward. In the batched setting the target rows are half the encoder
+batch, so caching could halve encoder work (~12% of total). The real reason to do it is that
+**a fixed augmentation bank makes the objective deterministic**, which is the precondition
+for idea 2.4 (L-BFGS) — the brief's most under-explored idea.
+
+### P5 — Then the research tier
+
+2.5 (structure-aware init) and 2.4 (L-BFGS on 128 parameters) remain the highest-upside
+items. 2.3 (progressive stroke addition) should be re-scoped: the stroke-count sweep showed
+8× the strokes costs only +6.7%, so it cannot pay off through *fewer strokes* — only through
+faster convergence.
+
+### Methodology debt to clear first
+
+1. **The eval set is too small for the recognition metrics.** 5 images / 5 classes means
+   zero-shot 125-way moves in 6.7% steps — one sketch. `data/paper_protocol.json` (200
+   images, 10 categories) already exists and should replace it for any quality claim that
+   turns on metric 2 or 3. `loss_eval` is unaffected and stays usable on the small set.
+2. **Widen the nondeterminism control** (§4.3), currently n=3. Every quality delta is judged
+   against that floor, so it deserves more than three runs.
+3. **Decide the §4 question.** It no longer reorders Tier 1 (that work is done and helps all
+   three goals equally), but P1 vs P2 vs P5 does depend on it: batch generation wants P2,
+   interactive latency wants Tier 4, a paper wants P1 + P5.
