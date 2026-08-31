@@ -205,3 +205,28 @@ class Stopwatch:
                       "std_ms": float(a.std()), "min_ms": float(a.min()),
                       "max_ms": float(a.max()), "n": int(a.size)}
         return out
+
+
+def require_free_gpu_memory(min_free_gb=4.0, hard=False):
+    """Warn (or abort) when the GPU is nearly full.
+
+    diffvg allocates with raw cudaMalloc/cudaFree, outside PyTorch's caching
+    allocator and without checking the result. Under exhaustion it does not raise
+    -- it renders into a buffer it did not get, and the output is silently wrong.
+    Observed on this machine while sharing the GPU: every sketch in a run encoded
+    to the same feature vector, which turned zero-shot top-1 from 13.3% into 0.0%
+    with no error anywhere. Any measurement taken near the memory ceiling is
+    suspect, so check before starting rather than debugging the numbers afterwards.
+    """
+    if not torch.cuda.is_available():
+        return None
+    free_b, total_b = torch.cuda.mem_get_info()
+    free_gb, total_gb = free_b / 2**30, total_b / 2**30
+    if free_gb < min_free_gb:
+        msg = (f"only {free_gb:.1f} GB free of {total_gb:.1f} GB. diffvg fails "
+               f"silently under memory pressure and will produce wrong output.")
+        if hard:
+            raise SystemExit(f"ABORT: {msg}")
+        print(f"WARNING: {msg}\n         Results from this run should not be trusted.",
+              flush=True)
+    return free_gb

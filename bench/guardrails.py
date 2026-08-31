@@ -11,6 +11,12 @@ quality half for a directory of CLIPasso runs:
   4. trajectory divergence  control-point drift vs a reference run, same image+seed
   5. contact sheet        target vs sketch, rendered side by side
 
+Metrics 2 and 3 also report continuous companions -- the zero-shot decision margin,
+the cosine similarity to the true photo, and mean log retrieval rank. The hard
+accuracies move in 1/N steps (6.7% for 15 runs), which cannot resolve a delta the
+size of CLIPasso's own run-to-run noise; the continuous forms have a standard error.
+Their noise floor is measured by bench/noise_floor.py.
+
 ViT-B/32 is deliberately NOT the RN101 that drives the optimisation loss, so metrics
 2 and 3 are semi-independent of the objective being optimised.
 
@@ -96,6 +102,36 @@ class Evaluator:
         return self.norm(self.model.encode_text(toks).float(), dim=-1)
 
 
+# --------------------------------------------------- continuous CLIP metrics
+# Hard top-1 moves in 1/N steps: 2.2% over all 45 runs, 6.7% over the 15 runs of
+# a single stroke count. That is coarser than the effect sizes we are trying to
+# resolve -- every speedup so far has landed inside CLIPasso's own run-to-run
+# noise. These are continuous and per-run, so they have a standard error and can
+# be compared against a measured noise floor (see noise_floor.py).
+def zeroshot_stats(sk_feats, txt_feats, true_idx):
+    """(correct, margin) for a zero-shot prompt classifier.
+
+    margin = sim(true prompt) - sim(best competing prompt), so margin > 0 is
+    exactly the argmax rule; `correct` and `margin` never disagree, the margin
+    just also says by how much.
+    """
+    sims = sk_feats @ txt_feats.T
+    idx = true_idx.view(-1, 1)
+    true_s = sims.gather(1, idx).squeeze(1)
+    other = sims.scatter(1, idx, float("-inf"))
+    margin = true_s - other.max(dim=1).values
+    return (margin > 0).cpu().numpy(), margin.cpu().numpy()
+
+
+def retrieval_stats(sk_feats, gal_feats, true_j):
+    """(rank, sim_to_true_photo). Rank is 1-based; ties count against the sketch."""
+    sims = sk_feats @ gal_feats.T
+    idx = true_j.view(-1, 1)
+    true_s = sims.gather(1, idx).squeeze(1)
+    rank = (sims > true_s.view(-1, 1)).sum(dim=1) + 1
+    return rank.cpu().numpy(), true_s.cpu().numpy()
+
+
 # ----------------------------------------------------------------- run loading
 def load_runs(run_dir):
     runs = []
@@ -132,6 +168,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    common.require_free_gpu_memory()
     import pydiffvg
     pydiffvg.set_use_gpu(torch.cuda.is_available())
     pydiffvg.set_device(device)
@@ -165,15 +202,17 @@ def main():
 
     # ---- metric 2: zero-shot classification
     txt_all = ev.encode_prompts([prompt_of.get(c, c.replace("_", " ")) for c in all_classes])
-    pred_all = (sk_feats @ txt_all.T).argmax(dim=1).cpu().numpy()
     true_all = np.array([all_classes.index(m["class"]) for m in metas])
-    top1_125 = float((pred_all == true_all).mean())
+    ok_all, margin_all = zeroshot_stats(
+        sk_feats, txt_all, torch.as_tensor(true_all, device=device))
+    top1_125 = float(ok_all.mean())
 
     sub_classes = sorted({m["class"] for m in metas})
     txt_sub = ev.encode_prompts([prompt_of.get(c, c.replace("_", " ")) for c in sub_classes])
-    pred_sub = (sk_feats @ txt_sub.T).argmax(dim=1).cpu().numpy()
     true_sub = np.array([sub_classes.index(m["class"]) for m in metas])
-    top1_sub = float((pred_sub == true_sub).mean())
+    ok_sub, margin_sub = zeroshot_stats(
+        sk_feats, txt_sub, torch.as_tensor(true_sub, device=device))
+    top1_sub = float(ok_sub.mean())
 
     # ---- metric 3: sketch -> photo retrieval
     gallery = manifest[:a.gallery]
@@ -183,12 +222,8 @@ def main():
             gal_paths.append(m["path"])
     print(f"encoding retrieval gallery ({len(gal_paths)} photos) ...")
     gal_feats = ev.encode_pil(gal_paths)
-    sims = sk_feats @ gal_feats.T
-    ranks = []
-    for i, m in enumerate(metas):
-        j = gal_paths.index(m["path"])
-        ranks.append(int((sims[i] > sims[i, j]).sum().item()) + 1)
-    ranks = np.array(ranks)
+    true_j = torch.as_tensor([gal_paths.index(m["path"]) for m in metas], device=device)
+    ranks, sim_true = retrieval_stats(sk_feats, gal_feats, true_j)
     r1, r5, r10 = [float((ranks <= k).mean()) for k in (1, 5, 10)]
 
     # ---- metric 1
@@ -202,11 +237,20 @@ def main():
         "retrieval_R1": r1, "retrieval_R5": r5, "retrieval_R10": r10,
         "retrieval_median_rank": float(np.median(ranks)),
         "gallery_size": len(gal_paths),
+        # continuous companions to the three metrics above
+        "zeroshot_margin_125way_mean": float(margin_all.mean()),
+        "zeroshot_margin_125way_sem": float(margin_all.std(ddof=1) / np.sqrt(len(margin_all))),
+        "zeroshot_margin_subset_mean": float(margin_sub.mean()),
+        "sim_true_photo_mean": float(sim_true.mean()),
+        "sim_true_photo_sem": float(sim_true.std(ddof=1) / np.sqrt(len(sim_true))),
+        "log_retrieval_rank_mean": float(np.log(ranks).mean()),
         "per_run": [{"name": r["name"], "class": r["class"], "num_paths": r["num_paths"],
                      "seed": r["seed"], "best_loss_eval": r["best_loss_eval"],
                      "retrieval_rank": int(rk),
-                     "zeroshot_correct_125": bool(p == t)}
-                    for r, rk, p, t in zip(runs, ranks, pred_all, true_all)],
+                     "sim_true_photo": float(st),
+                     "zeroshot_margin_125": float(mg),
+                     "zeroshot_correct_125": bool(ok)}
+                    for r, rk, st, mg, ok in zip(runs, ranks, sim_true, margin_all, ok_all)],
         "env": env_fingerprint(),
     }
 
@@ -276,6 +320,11 @@ def main():
     print(f"  retrieval R@1 / R@5 / R@10 {100*r1:5.1f}% / {100*r5:5.1f}% / {100*r10:5.1f}%   "
           f"(gallery {len(gal_paths)})")
     print(f"  retrieval median rank      {np.median(ranks):.0f}")
+    print(f"  zero-shot margin (125-way) {margin_all.mean():+.5f} "
+          f"+/- {margin_all.std(ddof=1)/np.sqrt(len(margin_all)):.5f} (sem)")
+    print(f"  sim to true photo          {sim_true.mean():.5f} "
+          f"+/- {sim_true.std(ddof=1)/np.sqrt(len(sim_true)):.5f} (sem)")
+    print(f"  mean log retrieval rank    {np.log(ranks).mean():.4f}")
     if "trajectory" in res:
         t = res["trajectory"]
         print(f"  vs {Path(a.compare_to).name}:")
