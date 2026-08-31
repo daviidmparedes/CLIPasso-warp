@@ -8,7 +8,10 @@ import pydiffvg
 import skimage
 import skimage.io
 import torch
-import wandb
+try:
+    import wandb
+except ImportError:                 # only needed with --use_wandb 1
+    wandb = None
 import PIL
 from PIL import Image
 from torchvision import transforms

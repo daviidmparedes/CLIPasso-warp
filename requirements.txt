@@ -17,3 +17,6 @@ ftfy
 regex
 tqdm
 gdown
+
+# Optional: only needed for --use_wandb 1
+# wandb

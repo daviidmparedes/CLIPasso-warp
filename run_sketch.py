@@ -105,9 +105,18 @@ def ensure_u2net():
         return
     p.parent.mkdir(parents=True, exist_ok=True)
     print("downloading the U2Net saliency model (one time, ~170 MB) ...")
-    subprocess.run(["gdown",
-                    "https://drive.google.com/uc?id=1ao1ovG1Qtx4b7EoskHXmi2E9rp5CHLcZ",
-                    "-O", str(p)], check=True)
+    # Invoked as a module rather than as a bare `gdown` command: the console script
+    # is only on PATH when the virtualenv is activated, and this has to work when
+    # the interpreter is called by full path too.
+    r = subprocess.run([sys.executable, "-m", "gdown",
+                        "https://drive.google.com/uc?id=1ao1ovG1Qtx4b7EoskHXmi2E9rp5CHLcZ",
+                        "-O", str(p)])
+    if r.returncode != 0 or not p.is_file():
+        sys.exit(
+            "could not download the U2Net model.\n"
+            "Google Drive rate-limits large files; try again shortly, or fetch it "
+            "manually to\n    " + str(p) + "\nfrom "
+            "https://drive.google.com/uc?id=1ao1ovG1Qtx4b7EoskHXmi2E9rp5CHLcZ")
 
 
 def main():

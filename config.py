@@ -5,7 +5,10 @@ import random
 import numpy as np
 import pydiffvg
 import torch
-import wandb
+try:
+    import wandb
+except ImportError:                 # only needed with --use_wandb 1
+    wandb = None
 
 
 def set_seed(seed):
@@ -134,6 +137,8 @@ def parse_arguments():
         os.mkdir(svg_logs_dir)
 
     if args.use_wandb:
+        if wandb is None:
+            raise SystemExit("--use_wandb 1 needs wandb: pip install wandb")
         wandb.init(project=args.wandb_project_name, entity=args.wandb_user,
                    config=args, name=args.wandb_name, id=wandb.util.generate_id())
 

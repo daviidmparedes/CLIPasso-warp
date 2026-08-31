@@ -15,7 +15,10 @@ import PIL
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
+try:
+    import wandb
+except ImportError:                 # only needed with --use_wandb 1
+    wandb = None
 from PIL import Image
 from torchvision import models, transforms
 from tqdm.auto import tqdm, trange
@@ -24,7 +27,6 @@ import config
 import sketch_utils as utils
 from models.loss import Loss
 from models.painter_params import Painter, PainterOptimizer
-from IPython.display import display, SVG
 
 
 def load_renderer(args, target_im=None, mask=None):
