@@ -31,19 +31,37 @@ Timings are for the default settings on one image, measured on an RTX PRO 6000
 
 ## Install
 
-Linux with an NVIDIA GPU and a working driver. About ten minutes, most of it
-compiling diffvg.
+Linux, an NVIDIA GPU with a working driver, and two things diffvg needs in order to
+compile:
+
+- **Python development headers** (`Python.h`). `sudo apt install python3-dev` on
+  Debian or Ubuntu, `sudo dnf install python3-devel` on Fedora or RHEL.
+- **A CUDA toolkit** providing `nvcc`. PyTorch bundles a CUDA *runtime*, not a
+  compiler, so the driver alone is not enough. `sudo apt install nvidia-cuda-toolkit`,
+  or from https://developer.nvidia.com/cuda-downloads.
+
+`setup.sh` checks for both before it downloads anything and tells you what is
+missing, so a bad environment costs you a second rather than ten minutes.
 
     git clone https://github.com/daviidmparedes/CLIPasso-warp
     cd CLIPasso-warp
     ./setup.sh
 
-`setup.sh` creates a virtualenv, installs PyTorch and the dependencies, then
-clones and compiles diffvg against the compute capability of the GPU in your
-machine. It finishes by rendering a test image and checking the gradients are
-finite, so if it prints "Setup complete" the install works.
+It creates a virtualenv, installs PyTorch and the dependencies, then clones and
+compiles diffvg against the compute capability of the GPU in your machine. It
+finishes by rendering a test image and checking the gradients are finite, so if it
+prints "Setup complete" the install works.
 
-If you need a different PyTorch CUDA build, set `CUDA_TAG`:
+On a shared machine where you have no root:
+
+    CUDA_HOME=/path/to/cuda ALLOW_LOCAL_PYTHON_HEADERS=1 ./setup.sh
+
+`CUDA_HOME` points at an existing toolkit; `ALLOW_LOCAL_PYTHON_HEADERS=1` downloads
+and unpacks the Python headers into `third_party/` without installing anything
+system-wide. Both were used to test this script on a cluster node with neither
+installed.
+
+To pin a particular PyTorch CUDA build, set `CUDA_TAG` (default `cu128`):
 
     CUDA_TAG=cu121 ./setup.sh
 
