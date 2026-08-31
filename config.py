@@ -51,6 +51,16 @@ def parse_arguments():
                         help="training stages, you can train x strokes, then freeze them and train another x strokes etc.")
     parser.add_argument("--lr_scheduler", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1.0)
+    # Shape of the schedule --lr_scheduler turns on. Defaults keep the shipped
+    # behaviour exactly: with lr_scheduler=0 these are never read.
+    parser.add_argument("--lr_schedule", type=str, default="cosine",
+                        choices=["const", "cosine", "linear"])
+    parser.add_argument("--lr_min_ratio", type=float, default=0.05,
+                        help="floor of the decay, as a fraction of --lr")
+    parser.add_argument("--lr_warmup", type=int, default=0,
+                        help="iterations of linear ramp from 0 before decaying")
+    parser.add_argument("--lr_decay_iters", type=int, default=0,
+                        help="decay over this many iterations (0 = --num_iter)")
     parser.add_argument("--color_lr", type=float, default=0.01)
     parser.add_argument("--color_vars_threshold", type=float, default=0.0)
     parser.add_argument("--batch_size", type=int, default=1,

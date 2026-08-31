@@ -945,10 +945,30 @@ well short of the brief's ~5×. P2 was run and split the diffvg problem in two �
 that is now fixed (§4.4, §4.5) and a work half that is not (§2). Priorities below are re-derived
 from that, not carried over.
 
-### N1 — Give CLIPasso a working learning-rate schedule (new; highest value, cheapest)
+### N1 — Give CLIPasso a working learning-rate schedule — **implemented, arms running**
 
-The single most surprising finding in §6 is that **nothing in CLIPasso makes the optimisation
-converge**. `lr = 1.0` with Adam and no decay means the control points move at a constant
+Status: `sketch_utils.get_epoch_lr()` is written (it did not exist), `config.py` gained
+`--lr_schedule / --lr_min_ratio / --lr_warmup / --lr_decay_iters`, and `bench/batch_seeds.py`
+applies the schedule per iteration and records the realised LR in every `config.npy`.
+**Defaults are unchanged**: with `--lr_scheduler 0` the function returns `args.lr` exactly, so
+the shipped behaviour — and every measurement above — is untouched.
+
+Five arms are running via `bench/run_lr_arms.sh`, scored by `bench/run_lr_eval.sh`:
+
+| arm | iterations | schedule | asks |
+|---|---:|---|---|
+| control | 2001 | const (`batched_freeze`, already on disk) | — |
+| B | 2001 | cosine → 0.05 | does settling improve quality at *no* saving? |
+| C0 | 1200 | const | plain truncation at 1.67× (§6's recommendation) |
+| **C** | **1200** | **cosine → 0.05** | **does decay beat truncation at matched cost?** |
+| D0 | 800 | const | plain truncation at 2.5× |
+| D | 800 | cosine → 0.05 | same, deeper |
+
+C vs C0 and D vs D0 are the comparisons that decide N1; B answers whether the schedule earns
+its place even at full length. Speedups here are arithmetic (2001/1200), not measured — the GPU
+is shared, so only the quality half of each pair needs running.
+
+The motivation is §6's finding that **nothing in CLIPasso makes the optimisation converge**. `lr = 1.0` with Adam and no decay means the control points move at a constant
 ~0.19 px/iter forever; the repo's own scheduler hook calls a function that does not exist.
 
 This is not itself a speed change, which is why it has no §4 entry — it is the multiplier on
@@ -1014,6 +1034,61 @@ overhead it targets. Realistic expectation ~1.1×. Worth doing after N1–N3.
 Still the precondition for 2.4 (L-BFGS), because a fixed augmentation bank makes the objective
 deterministic. 2.5 (structure-aware init) remains the highest-upside untouched item. 2.3
 should stay re-scoped: 8× the strokes costs only +6.7%, so it cannot pay through fewer strokes.
+
+
+### Untested levers found while implementing N1 (none are in the brief)
+
+Reading `bench/batch_seeds.py:60-88` and `models/loss.py:420-435` for the schedule wiring
+turned up work the pipeline repeats for no reason. Per iteration, with M sketches and
+`num_aug_clip = A`, the encoder sees `2M(1+A)` images — at the shipped M=3, A=4 that is
+**30 images through RN101 per iteration**, of which:
+
+| # | lever | encoder work removed | semantics | expected end-to-end |
+|---|---|---:|---|---:|
+| A1 | `num_aug_clip` 4 → 2 | 40% | changes the objective — pure quality trade | ~1.1–1.2× |
+| A2 | cache the *clean* target view | 10% | **none** — it is byte-identical every iteration | ~1.02× |
+| A3 | share target augmentations across batched seeds | (M−1)/2M → 33% at M=3, 40% at M=5 | breaks §1.1's equivalence claim; seeds stop being independent | ~1.1× |
+| A4 | batch `serialize_scene`'s 16 per-shape `points.cpu()` into one copy | — | none | ~1.01× |
+
+**A2 is the one to do first**: in `batched_conv_loss` all M sketches share one target, so
+`normalize_transform(y)` is computed and encoded M times per iteration and 2001 times per run,
+and it is the same tensor every single time. In eval mode the *entire* target side is that one
+view, so eval encoder work halves. This is the same class as 0.1/0.3/0.4 — free, provably
+output-identical, found by reading rather than by guessing.
+
+**A3 is the interesting one and the risky one.** Each seed currently draws its own random
+augmentation of the shared target, so 15 of the 30 images are augmentations of the *same photo*
+under different transforms. Sharing one set across seeds cuts that to A. But §1.1's headline
+claim is that batching seeds is *exactly* N independent runs, and this would break it — the
+seeds' gradients become correlated through a shared augmentation draw. It should be measured as
+a deliberate departure with its own quality run, not folded in quietly.
+
+**A4 is quantified and small.** After 0.4 strips the asserts, the forward is 21 kernels of which
+16 are the per-shape D2H copies — but they total 0.013 ms of GPU time. Their cost is 16 syncs,
+not bandwidth, and removing 103 kernels plus 17 syncs in 0.4 only bought 1.03×. Do it when
+touching that code for another reason, not on its own.
+
+### Ready to run the moment the card is free — `bash bench/run_night.sh`
+
+The script guards on ≥80 GB free and aborts otherwise, because numbers taken under contention
+are worse than no numbers, and because diffvg renders silently wrong output near the memory
+ceiling (debt 1). Phases, in the order they pay off:
+
+1. **Clean re-measurement of the ladder** (~105 min). Every s/seed in the summary table is
+   currently an upper bound taken under contention. This is the single highest-value use of an
+   idle card — it does not discover anything, it makes what we already claim defensible.
+2. **0.4 end-to-end on the real batched pipeline.** Only measured on a synthetic loop so far.
+   Needs a `--fast-serialize` flag in `batch_seeds.py` first; the script detects and skips it.
+3. **Tiling sweep, clean.** The M=1→16 trend is monotone but the paired median and min-ratio
+   disagreed by up to 30% under load.
+4. **`num_samples` 2 → 1 timing**, to close a question whose quality half already looks negative.
+
+Not in the script because they need code written first, in priority order: A2, then integrating
+tiling into the batched harnesses (N3), then A1's quality arm, then `torch.compile` on the CLIP
+subgraph (N5). And one long, contention-tolerant job that can run alongside anything because it
+produces only quality numbers: **widening the eval set to `data/paper_protocol.json`** (200
+images, ~2 GPU-hours), which the power table in §6 says would take the perceptual metrics from
+resolving ~50% of the signal to ~20%.
 
 ### Methodology debt
 

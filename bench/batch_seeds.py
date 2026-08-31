@@ -113,6 +113,15 @@ def main():
     ap.add_argument("--save-interval", type=int, default=10)
     ap.add_argument("--out", default=str(ROOT / "bench" / "results" / "batched"))
     ap.add_argument("--name", default=None)
+    # N1: the repo's schedule hook called a function that did not exist, so nothing
+    # ever decayed the step size. Off by default -- the shipped behaviour stays the
+    # measured baseline until an arm proves otherwise.
+    ap.add_argument("--lr-scheduler", type=int, default=0)
+    ap.add_argument("--lr-schedule", default="cosine",
+                    choices=["const", "cosine", "linear"])
+    ap.add_argument("--lr-min-ratio", type=float, default=0.05)
+    ap.add_argument("--lr-warmup", type=int, default=0)
+    ap.add_argument("--lr-decay-iters", type=int, default=0)
     a = ap.parse_args()
 
     if a.target is None:
@@ -133,9 +142,12 @@ def main():
     t_boot = time.perf_counter()
 
     # args for seed 0 drive the shared pieces (target, mask, loss)
+    lr_opts = dict(lr_scheduler=a.lr_scheduler, lr_schedule=a.lr_schedule,
+                   lr_min_ratio=a.lr_min_ratio, lr_warmup=a.lr_warmup,
+                   lr_decay_iters=a.lr_decay_iters)
     base_args = make_args(a.target, outroot, f"{cls}_{stem}_{a.num_paths}strokes_batched",
                           num_paths=a.num_paths, seed=seeds[0], num_iter=a.num_iter,
-                          save_interval=10 ** 9, eval_interval=10 ** 9)
+                          save_interval=10 ** 9, eval_interval=10 ** 9, **lr_opts)
     with common.quiet():
         loss_func = Loss(base_args)
         inputs, mask = pr.get_target(base_args)
@@ -146,7 +158,8 @@ def main():
         for s in seeds:
             sa = make_args(a.target, outroot, f"{cls}_{stem}_{a.num_paths}strokes_seed{s}",
                            num_paths=a.num_paths, seed=s, num_iter=a.num_iter,
-                           save_interval=a.save_interval, eval_interval=a.eval_interval)
+                           save_interval=a.save_interval, eval_interval=a.eval_interval,
+                           **lr_opts)
             config.set_seed(s)
             p = Painter(num_strokes=sa.num_paths, args=sa, num_segments=sa.num_segments,
                         imsize=sa.image_scale, device=sa.device, target_im=inputs, mask=mask)
@@ -158,6 +171,10 @@ def main():
 
     params = [pt for p in painters for pt in p.parameters()]
     optim = torch.optim.Adam(params, lr=base_args.lr)   # == 3 separate Adams
+    # All seeds share one schedule because they share one iteration counter; the
+    # per-parameter Adam state stays independent, so this is still N separate runs.
+    import sketch_utils as sk_utils
+    lr_of = (lambda ep: sk_utils.get_epoch_lr(ep, base_args)) if a.lr_scheduler else None
     sync()
     boot = time.perf_counter() - t_boot
     cl = loss_func.loss_mapper["clip_conv_loss"]
@@ -173,7 +190,14 @@ def main():
     min_delta = 1e-5
     t0 = time.perf_counter()
 
+    lr_trace = []
     for epoch in range(a.num_iter):
+        if lr_of is not None:
+            cur_lr = lr_of(epoch)
+            for g in optim.param_groups:
+                g["lr"] = cur_lr
+            if epoch % a.eval_interval == 0:
+                lr_trace.append(cur_lr)
         for p in painters:
             p.set_random_noise(epoch)
         optim.zero_grad()
@@ -211,6 +235,7 @@ def main():
         p.save_svg(per_args[i].output_dir, "final_svg")
         cfg = vars(per_args[i]).copy()
         cfg["loss_eval"] = state[i]["loss_eval"]
+        cfg["lr_trace"] = lr_trace
         cfg.update(state[i]["cfg"])
         np.save(f"{per_args[i].output_dir}/config.npy", cfg)
 

@@ -293,3 +293,43 @@ def get_mask_u2net(args, pil_im):
     im_final = Image.fromarray(im_final)
 
     return im_final, predict
+
+
+def get_epoch_lr(counter, args):
+    """Learning rate for iteration `counter`.
+
+    This function is referenced by PainterOptimizer.update_lr() but was missing from
+    the repository, so `--lr_scheduler 1` raised AttributeError and no schedule could
+    ever run. Restoring it is the point of this change: with the shipped constant
+    lr=1.0, Adam's step magnitude is ~lr regardless of gradient scale, so the control
+    points keep moving at ~0.19 px/iter for the whole run and the optimisation never
+    settles (measured in RESULTS.md section 6).
+
+    Shapes:
+      const   the shipped behaviour, returned when scheduling is off
+      cosine  half-cosine from lr down to lr*lr_min_ratio over lr_decay_iters
+      linear  straight line over the same interval
+
+    `lr_warmup` linearly ramps from 0 so Adam's moment estimates are not built from
+    a single huge first step. `lr_decay_iters` defaults to num_iter but can be set
+    shorter to decay faster than the run length, or longer to decay more gently.
+    """
+    schedule = getattr(args, "lr_schedule", "const")
+    if not getattr(args, "lr_scheduler", 0) or schedule == "const":
+        return args.lr
+
+    warmup = getattr(args, "lr_warmup", 0)
+    if warmup and counter < warmup:
+        return args.lr * (counter + 1) / warmup
+
+    decay_iters = getattr(args, "lr_decay_iters", 0) or args.num_iter
+    min_ratio = getattr(args, "lr_min_ratio", 0.05)
+    t = min(max(counter - warmup, 0) / max(decay_iters - warmup, 1), 1.0)
+
+    if schedule == "cosine":
+        factor = min_ratio + (1 - min_ratio) * 0.5 * (1 + np.cos(np.pi * t))
+    elif schedule == "linear":
+        factor = 1.0 - (1 - min_ratio) * t
+    else:
+        raise ValueError(f"unknown lr_schedule {schedule!r}")
+    return args.lr * factor
