@@ -764,6 +764,57 @@ fails the same way: in-place sds were 0.00351 vs 0.00910, but the absolute sds a
 0.03709 — identical. **Only the matched-budget absolute comparison answers the question**, and it
 reverses the conclusion. Recorded because the ratio looked convincing and was not.
 
+#### Does settling shrink the run-to-run divergence? Partly, and not where it would help most
+
+`bash bench/run_lr_replicate.sh` then `bench/noise_floor.py --a lr_B --b lr_B_rep2` →
+`bench/results/quality_curve/noise_floor_lrB_rep.json`
+
+This was the one N1 question worth GPU time regardless of speed. §4.3's 57.5 px divergence is
+the floor every quality claim here is judged against, so halving it would make every future
+comparison more sensitive. A second full replicate of arm B answers it:
+
+| | const lr (n=15) | cosine over 2001 (n=15) | |
+|---|---:|---:|---|
+| control-point drift | 57.5 ± 7.9 px | **37.2 ± 5.7 px** | **1.55× tighter** |
+| zero-shot flips, 5-way | 40.0% | **26.7%** | better |
+| zero-shot flips, 125-way | 13.3% | **6.7%** | better |
+| CLIP sim between replicates | 0.9368 ± 0.0251 | 0.9390 ± 0.0239 | unchanged |
+| `loss_eval` paired \|A−B\| | 0.00905 | **0.01839** | **2× worse** |
+
+The geometry converges markedly and the categorical decisions become twice as stable. But
+`loss_eval` reproducibility gets *worse*, which is coherent rather than contradictory: decay
+makes each run commit to whichever basin it found, so within-run wobble falls (4.55×) while the
+between-run spread of the committed value rises. Since `loss_eval` is the one guardrail with
+enough signal-to-noise to resolve small effects (§6), doubling its floor is the opposite of what
+was wanted. **Settling does not buy a tighter measurement floor overall**, so N1 does not rescue
+itself on this front either.
+
+Worth keeping in mind if a future change needs *geometric* reproducibility — 37 vs 57 px is a
+real gain, just not one that helps the metric we actually judge with.
+
+#### A2 (deduplicate the clean target view) — abandoned after verification
+
+Listed as the best free win in the previous plan: in `batched_conv_loss` every item's target
+block starts with `normalize_transform(target)`, so when M seeds share an image those M rows are
+identical to each other and identical on all 2001 iterations, yet are encoded every time.
+Implemented and checked with `bench/verify_a2.py`, which forces the original path by cloning the
+target (byte-identical pixels at a different address) so one process yields both reference and
+test. Two things came out of it, both negative:
+
+1. **It is not bit-identical.** The `fc` term differs by 3e-5. Not a logic error — CLIP runs in
+   fp16, and shrinking the encoder batch from 15 rows to 13 changes the GEMM tiling. The conv
+   terms match exactly; only the cosine-similarity term is sensitive enough to show it.
+2. **The saving was overestimated by ~20×.** The claim of "10% of encoder work, ~1.02×" conflated
+   10% of encoder *rows* with 10% of encoder *cost*, and ignored that the target branch is
+   forward-only while the sketch branch is forward+backward. Correct accounting: 2 of 30 rows,
+   in a branch worth roughly a third of encoder cost, in an encoder worth ~25% of an iteration —
+   **about 0.56% end-to-end.**
+
+Reverted. A sub-1% gain that costs exact reproducibility is the wrong trade in a project that
+judges every change against a 0.009 noise floor. The observation that prompted it is still
+correct, and A1 (`num_aug_clip` 4 → 2, which removes 40% of encoder rows) is unaffected by any of
+this — but its row accounting should be redone the same way before anyone runs it.
+
 #### What to keep
 
 The schedule is **not** added to the ladder. It is kept because the missing-function bug is real
@@ -1101,15 +1152,16 @@ turned up work the pipeline repeats for no reason. Per iteration, with M sketche
 | # | lever | encoder work removed | semantics | expected end-to-end |
 |---|---|---:|---|---:|
 | A1 | `num_aug_clip` 4 → 2 | 40% | changes the objective — pure quality trade | ~1.1–1.2× |
-| A2 | cache the *clean* target view | 10% | **none** — it is byte-identical every iteration | ~1.02× |
+| ~~A2~~ | ~~cache the clean target view~~ | ~~10%~~ | **tested and abandoned** — not bit-identical, and worth ~0.56% not 1.02× (§4.6) | — |
 | A3 | share target augmentations across batched seeds | (M−1)/2M → 33% at M=3, 40% at M=5 | breaks §1.1's equivalence claim; seeds stop being independent | ~1.1× |
 | A4 | batch `serialize_scene`'s 16 per-shape `points.cpu()` into one copy | — | none | ~1.01× |
 
-**A2 is the one to do first**: in `batched_conv_loss` all M sketches share one target, so
-`normalize_transform(y)` is computed and encoded M times per iteration and 2001 times per run,
-and it is the same tensor every single time. In eval mode the *entire* target side is that one
-view, so eval encoder work halves. This is the same class as 0.1/0.3/0.4 — free, provably
-output-identical, found by reading rather than by guessing.
+~~**A2 is the one to do first**~~ — it was done, and it failed on both counts: the change is not
+bit-identical (fp16 batch-shape sensitivity, 3e-5 on the `fc` term) and the saving is ~0.56%, not
+the ~1.02× estimated here. The estimate in this table was wrong for a specific and repeatable
+reason — it counted encoder *rows* as if they were encoder *cost*, and ignored that the target
+branch is forward-only. **Redo A1's arithmetic the same way before running it**; the 40% figure
+below has the same flaw. Full write-up in §4.6.
 
 **A3 is the interesting one and the risky one.** Each seed currently draws its own random
 augmentation of the shared target, so 15 of the 30 images are augmentations of the *same photo*
