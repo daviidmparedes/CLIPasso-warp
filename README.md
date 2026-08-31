@@ -1,130 +1,147 @@
-# CLIPasso: Semantically-Aware Object Sketching (SIGGRAPH 2022)
+# CLIPasso, runnable
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/yael-vinker/CLIPasso/blob/main/CLIPasso.ipynb) 
-[![arXiv](https://img.shields.io/badge/arXiv-2108.00946-b31b1b.svg)](https://arxiv.org/abs/2202.05822)
+A fork of [CLIPasso: Semantically-Aware Object Sketching](https://clipasso.github.io/clipasso/)
+that installs on a current machine, runs on a current GPU, and draws about three
+times faster than the original at the same settings.
 
+The original code was published in 2022 against Python 3.7, PyTorch 1.7.1 and
+CUDA 10.1. On a recent machine it does not install, and on a GPU newer than
+Ampere it cannot run at all. This fork changes what is needed to fix that, plus
+four optimisations that leave the output unchanged.
 
+Nothing here changes the method. The sketches are the same sketches.
 
-[[Project Website](https://clipasso.github.io/clipasso/)]
-<br>
-<br>
-This is the official implementation of CLIPasso, a method for converting an image of an object to a sketch, allowing for varying levels of abstraction. <br>
-
-<br>
-<br>
-
-![](repo_images/teaser2.png?raw=true)
-At a high level, we define a sketch as a set of Bézier curves and use a differentiable rasterizer ([diffvg](https://github.com/BachiLi/diffvg)) to optimize the parameters of the curves directly with respect to a CLIP-based perceptual loss. <br>
-We combine the final and intermediate activations of a pre-trained CLIP model to achieve both geometric and semantic simplifications.
-<br> The abstraction degree is controlled by varying the number of strokes.
-    
-<br>
-
-## Installation
-### Installation via Docker [Recommended]
-You can simply pull the docker image from docker hub, containing all the required libraries and packages:
-```bash
-docker pull yaelvinker/clipasso_docker
-docker run --name clipsketch -it yaelvinker/clipasso_docker /bin/bash
-```
-Now you should have a running container.
-Inside the container, clone the repository:
-
-```bash
-cd /home
-git clone https://github.com/yael-vinker/CLIPasso.git
-cd CLIPasso/
-```
-Now you are all set and ready to move to the next stage (Run Demo).
-
-### Installation via pip
-Note that it is recommended to use the provided docker image, as we rely on diffvg which has specific requirements and does not compile smoothly on every environment.
-1.  Clone the repo:
-```bash
-git clone https://github.com/yael-vinker/CLIPasso.git
-cd CLIPasso
-```
-2. Create a new environment and install the libraries:
-```bash
-python3.7 -m venv clipsketch
-source clipsketch/bin/activate
-pip install -r requirements.txt
-pip install torch==1.7.1+cu101 torchvision==0.8.2+cu101 -f https://download.pytorch.org/whl/torch_stable.html
-pip install git+https://github.com/openai/CLIP.git
-```
-3. Install diffvg:
-```bash
-git clone https://github.com/BachiLi/diffvg
-cd diffvg
-git submodule update --init --recursive
-python setup.py install
-```
-
-<br>
-
-## Run Demo
-
-<!-- #### Run a model on your own image -->
-
-The input images to be drawn should be located under "target_images".
-To sketch your own image, from CLIPSketch run:
-```bash
-python run_object_sketching.py --target_file <file_name>
-```
-The resulting sketches will be saved to the "output_sketches" folder, in SVG format.
-
-Optional arguments:
-* ```--num_strokes``` Defines the number of strokes used to create the sketch, which determines the level of abstraction. The default value is set to 16, but for different images, different numbers might produce better results. 
-* ```--mask_object``` It is recommended to use images without a background, however, if your image contains a background, you can mask it out by using this flag with "1" as an argument.
-* ```--fix_scale``` If your image is not squared, it might be cut off, it is recommended to use this flag with 1 as input to automatically fix the scale without cutting the image.
-* ```--num_sketches``` As stated in the paper, by default there will be three parallel running scripts to synthesize three sketches and automatically choose the best one. However, for some environments (for example when running on CPU) this might be slow, so you can specify --num_sketches 1 instead.
-* ```-cpu``` If you want to run the code on the cpu (not recommended as it might be very slow).
-
-<br>
-<b>For example, below are optional running configurations:</b>
-<br>
-
-Sketching the camel with defauls parameters:
-```bash
-python run_object_sketching.py --target_file "camel.png"
-```
-Producing a single sketch of the camel at lower level of abstraction with 32 strokes:
-```bash
-python run_object_sketching.py --target_file "camel.png" --num_strokes 32 --num_sketches 1
-```
-Sketching the flamingo with higher level of abstraction, using 8 strokes:
-```bash
-python run_object_sketching.py --target_file "flamingo.png" --num_strokes 8
-```
-
-## Related Work
-[CLIPDraw](https://arxiv.org/abs/2106.14843): Exploring Text-to-Drawing Synthesis through Language-Image Encoders, 2021 (Kevin Frans, L.B. Soros, Olaf Witkowski)
-
-[Diffvg](https://github.com/BachiLi/diffvg): Differentiable vector graphics rasterization for editing and learning, ACM Transactions on Graphics 2020 (Tzu-Mao Li, Michal Lukáč, Michaël Gharbi, Jonathan Ragan-Kelley)
+For the paper, the project page, the Colab demo and the interactive notebooks, go
+to the [original repository](https://github.com/yael-vinker/CLIPasso).
 
 
-## Citation
-If you make use of our work, please cite our paper:
+## What is different
 
-```
-@misc{vinker2022clipasso,
-      title={CLIPasso: Semantically-Aware Object Sketching}, 
-      author={Yael Vinker and Ehsan Pajouheshgar and Jessica Y. Bo and Roman Christian Bachmann and Amit Haim Bermano and Daniel Cohen-Or and Amir Zamir and Ariel Shamir},
-      year={2022},
-      eprint={2202.05822},
-      archivePrefix={arXiv},
-      primaryClass={cs.GR}
-}
-```
+| | upstream | this fork |
+|---|---|---|
+| Python | 3.7 | 3.8 or newer |
+| PyTorch | 1.7.1 / CUDA 10.1 | current, built for your GPU |
+| GPU support | up to Ampere | whatever card you have, including Blackwell |
+| diffvg | does not build against CUDA 12 | built by `setup.sh` |
+| Time for 3 sketches at 16 strokes | 6 min 19 s | 2 min 0 s |
 
-## License
-Shield: [![CC BY-NC-SA 4.0][cc-by-nc-sa-shield]][cc-by-nc-sa]
+Timings are for the default settings on one image, measured on an RTX PRO 6000
+(Blackwell). See [Speed](#speed) for the breakdown and the caveats.
 
-This work is licensed under a
-[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License][cc-by-nc-sa].
 
-[![CC BY-NC-SA 4.0][cc-by-nc-sa-image]][cc-by-nc-sa]
+## Install
 
-[cc-by-nc-sa]: http://creativecommons.org/licenses/by-nc-sa/4.0/
-[cc-by-nc-sa-image]: https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png
-[cc-by-nc-sa-shield]: https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg
+Linux with an NVIDIA GPU and a working driver. About ten minutes, most of it
+compiling diffvg.
+
+    git clone https://github.com/daviidmparedes/CLIPasso-warp
+    cd CLIPasso-warp
+    ./setup.sh
+
+`setup.sh` creates a virtualenv, installs PyTorch and the dependencies, then
+clones and compiles diffvg against the compute capability of the GPU in your
+machine. It finishes by rendering a test image and checking the gradients are
+finite, so if it prints "Setup complete" the install works.
+
+If you need a different PyTorch CUDA build, set `CUDA_TAG`:
+
+    CUDA_TAG=cu121 ./setup.sh
+
+
+## Use
+
+    source .venv/bin/activate
+    python run_sketch.py --target target_images/camel.png
+
+The result is written to `output_sketches/camel/`, with the chosen sketch at
+`best_sketch.svg`.
+
+Useful options:
+
+    --num-strokes N     how many strokes (default 16). Fewer is more abstract.
+    --num-sketches N    how many sketches to draw (default 3); the best is kept
+    --num-iter N        optimisation steps per sketch (default 2001)
+    --mask-object       remove the background first; use when the subject is not isolated
+    --fix-scale         use when the image is not square
+    --output-dir DIR    write somewhere other than output_sketches/
+    --save-interval N   also save an SVG every N steps, to watch the sketch form
+
+The first run downloads the U2Net saliency model (about 170 MB) once.
+
+Drawing several sketches and keeping the best is how CLIPasso is meant to be
+used: the result depends on where the strokes are initialised, and some
+initialisations fail. `--num-sketches 3` is the default for that reason, and
+because of how this fork works it costs much less than three times one sketch.
+
+`painterly_rendering.py` still works exactly as upstream if you want the
+single-sketch entry point.
+
+
+## Speed
+
+Measured at 16 strokes over five images and three sketches each, as seconds per
+sketch:
+
+| change | speedup | cumulative | s/sketch |
+|---|---|---|---|
+| upstream | - | 1.00x | 126.3 |
+| release the autograd graph each iteration | 1.48x | 1.48x | 85.3 |
+| draw all sketches in one process | 1.67x | 2.47x | 51.1 |
+| freeze the CLIP encoder, skip the unused loss | 1.28x | 3.16x | 40.0 |
+
+Every one of these is a change to how the work is scheduled, not to what is
+computed:
+
+- **Releasing the autograd graph.** The training loop kept the previous
+  iteration's graph alive across the next forward pass. diffvg allocates outside
+  PyTorch's caching allocator, so with its graph pinned the next backward falls
+  back to raw `cudaMalloc`/`cudaFree`, and `cudaFree` synchronises the device.
+  diffvg's backward costs 26.4 ms with the graph retained and 7.7 ms without.
+
+- **Drawing all sketches in one process.** Upstream runs one process per sketch,
+  each reloading CLIP and the saliency model and then handing the GPU one small
+  sketch at a time. Because the sketches have disjoint parameters, stepping them
+  together under one optimiser is exactly equivalent to running them separately,
+  and it gives the GPU enough work to be worth launching.
+
+- **Freezing the CLIP encoder.** The encoder is frozen guidance; only the stroke
+  control points are optimised. Its parameters still had `requires_grad=True`, so
+  autograd allocated and freed gradient buffers for 119.7 M parameters every
+  iteration. The same commit stops building a second CLIP model that the default
+  configuration never calls.
+
+Quality was checked rather than assumed, on the repository's own evaluation loss
+and on two measures that do not use the model being optimised against: zero-shot
+classification and sketch-to-photo retrieval with a different CLIP backbone. All
+differences are smaller than the difference between two runs of the *unmodified*
+code with the same seed, which is substantial: CLIPasso is not deterministic,
+because diffvg's backward accumulates gradients with `atomicAdd`, and over 2001
+steps that grows to about 57 px of mean control-point drift on a 224 px canvas.
+
+Two caveats on the numbers. They were taken on a GPU shared with another job, so
+the ratios are paired and trustworthy but the absolute times are upper bounds.
+And they are one card and one image set; your mileage will differ.
+
+The measurement harness, the full log and several things that did not work are on
+the `experiments` branch.
+
+
+## Credit
+
+All of the method and nearly all of the code is the work of the original authors.
+If you use this, cite their paper:
+
+    @article{vinker2022clipasso,
+        title={CLIPasso: Semantically-Aware Object Sketching},
+        author={Vinker, Yael and Pajouheshgar, Ehsan and Bo, Jessica Y and
+                Bachmann, Roman Christian and Bermano, Amit Haim and
+                Cohen-Or, Daniel and Zamir, Amir and Shamir, Ariel},
+        journal={ACM Transactions on Graphics (TOG)},
+        volume={41},
+        number={4},
+        pages={1--11},
+        year={2022},
+        publisher={ACM New York, NY, USA}
+    }
+
+Licensed as upstream; see LICENSE.
