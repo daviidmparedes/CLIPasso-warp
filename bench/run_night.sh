@@ -3,17 +3,20 @@
 #
 # Every absolute millisecond in RESULTS.md was measured while another researcher's
 # job held 83-95 GB of the 97 GB card. Paired/interleaved measurement makes the
-# *ratios* trustworthy, but the absolute numbers are upper bounds and the ladder's
-# s/seed figures need one clean pass before they go anywhere public.
+# *ratios* trustworthy, but the absolute s/seed figures are upper bounds and need
+# one clean pass before they go anywhere public.
 #
-# Usage:  nohup bash bench/run_night.sh > bench/logs/night.log 2>&1 &
+#   nohup bash bench/run_night.sh > bench/logs/night.log 2>&1 &
 #
-# The guard below aborts rather than producing numbers that look clean and are not.
-# Raise SKIP_GUARD=1 only if you know the card is yours.
+# SAFETY: every phase writes under bench/results/night/. Nothing here reuses
+# bench/run_tier11.sh or bench/run_freeze_batched.sh, because those have hardcoded
+# --out paths that would overwrite bench/results/{batched,batched_freeze} and
+# baseline/patched_nolog -- all of which are live comparison arms, including the
+# N1 control. Re-running a timing measurement must never destroy a quality result.
 set -uo pipefail
 cd /home/dmiranda/CLIPasso
 source .venv/bin/activate
-mkdir -p bench/logs
+mkdir -p bench/logs bench/results/night
 
 MIN_FREE_GB=${MIN_FREE_GB:-80}
 if [ "${SKIP_GUARD:-0}" != "1" ]; then
@@ -31,40 +34,72 @@ PY
 fi
 echo "=== starting $(date -Is) ==="
 
+# Run the batched pipeline over the 5-image eval set, into a named directory.
+# $1 = output subdirectory, remaining args are passed to batch_seeds.py.
+batched_over_eval_set () {
+  local sub=$1; shift
+  python - "$sub" "$@" <<'PY'
+import json, subprocess, sys, time
+from pathlib import Path
+ROOT = Path("/home/dmiranda/CLIPasso")
+sub, extra = sys.argv[1], sys.argv[2:]
+out = ROOT / "bench" / "results" / "night" / sub
+ev = json.loads((ROOT / "data" / "eval_set.json").read_text())
+tot = 0.0
+for it in ev:
+    t0 = time.perf_counter()
+    r = subprocess.run([sys.executable, "bench/batch_seeds.py", "--target", it["path"],
+        "--num-paths", "16", "--num-seeds", "3", "--num-iter", "2001",
+        "--eval-interval", "10", "--save-interval", "1000000",
+        "--out", str(out)] + extra, cwd=ROOT, capture_output=True, text=True)
+    if r.returncode:
+        print(f"  {it['class']:<10} FAILED\n{r.stdout[-800:]}\n{r.stderr[-800:]}", flush=True)
+        continue
+    d = time.perf_counter() - t0; tot += d
+    print(f"  {it['class']:<10} {d:7.1f}s for 3 seeds = {d/3:6.1f}s/seed", flush=True)
+print(f"  -> {sub}: {tot:.1f}s over {len(ev)} images = {tot/len(ev)/3:.1f}s per seed")
+PY
+}
+
 # ---------------------------------------------------------------- phase 1
-# The ladder, re-measured clean. This is the headline deliverable of the night:
-# it converts every s/seed figure in the summary table from "upper bound under
-# contention" into a measurement. Quality is unchanged and is not re-run.
-echo "### phase 1: clean ladder re-measurement (n=16, 5 images x 3 seeds)"
-python bench/run_baseline.py --strokes 16 --seeds 0,1000,2000 --tag night_shipped \
-  || echo "phase 1a FAILED"
-bash bench/run_tier11.sh 2>&1 | tail -5 || echo "phase 1b FAILED"
-bash bench/run_freeze_batched.sh 2>&1 | tail -5 || echo "phase 1c FAILED"
+# The ladder's live arms, re-timed clean. This is the night's headline deliverable:
+# it does not discover anything, it converts the summary table's s/seed figures
+# from contended upper bounds into measurements.
+#
+# The 126.3 s/seed "as shipped" number cannot be reproduced from this working tree
+# (0.1/0.2/0.3 are applied here). Re-deriving it needs `git checkout main` first,
+# which is deliberately NOT automated overnight -- do it by hand if the ladder's
+# base point matters more than its ratios.
+echo "### phase 1a: per-process arm, n=16 x 3 seeds x 5 images"
+python bench/run_baseline.py --strokes 16 --seeds 3 --save-interval 1000000 \
+  --tag night_perproc --out bench/results/night/baseline || echo "phase 1a FAILED"
+
+echo "### phase 1b: batched seeds (Tier 1.1 + freeze), clean timing"
+batched_over_eval_set batched
 
 # ---------------------------------------------------------------- phase 2
-# 0.4 end-to-end on the real batched pipeline. Currently only measured on a
-# synthetic loop (1.03x idle / 1.13x shared); this is the number that would let it
-# join the ladder. Requires the --fast-serialize flag in batch_seeds.py.
+# 0.4 end-to-end on the real pipeline. So far it is only measured on a synthetic
+# loop (1.03x idle / 1.13x shared); this is the number that would let it join the
+# ladder. Needs a --fast-serialize flag in batch_seeds.py, which does not exist yet.
 echo "### phase 2: 0.4 (assert-free serialize) end-to-end"
 if grep -q "fast-serialize" bench/batch_seeds.py; then
-  bash bench/run_freeze_batched.sh 2>&1 | tail -3
+  batched_over_eval_set batched_fastser --fast-serialize 1
 else
-  echo "SKIPPED: bench/batch_seeds.py has no --fast-serialize flag yet (see RESULTS.md N3)"
+  echo "  SKIPPED: bench/batch_seeds.py has no --fast-serialize flag yet (RESULTS.md N3)"
 fi
 python bench/fast_serialize.py --strokes 16 --iters 400 --verify --train-loop \
   || echo "phase 2b FAILED"
 
 # ---------------------------------------------------------------- phase 3
-# Tiling, clean. The M=1..16 sweep showed a monotone trend to 1.5-1.8x on diffvg
-# fwd+bwd, but every point was contended; the paired medians and min-ratios
+# Tiling, clean. The M=1..16 sweep trends monotonically to 1.5-1.8x on diffvg
+# fwd+bwd, but every point was contended and the paired median and min-ratio
 # disagreed by up to 30%.
 echo "### phase 3: tiling sweep, clean"
 bash bench/run_tiled_sweep.sh 2>&1 | grep -E "^###|forward|kernel reduction|correctness"
 
 # ---------------------------------------------------------------- phase 4
-# num_samples 2 -> 1: timing half. The quality half is already provisionally
-# negative (the renderer's own gradient cosine falls 0.947 -> 0.730), so this only
-# needs enough numbers to close the question.
+# num_samples 2 -> 1: timing half. The quality half already looks negative (the
+# renderer's own gradient cosine falls 0.947 -> 0.730), so this just closes it.
 echo "### phase 4: num_samples 2 -> 1"
 for M in 1 5; do
   python bench/tiled_render.py --num-scenes $M --strokes 16 --samples 1 \
@@ -72,3 +107,5 @@ for M in 1 5; do
 done
 
 echo "=== finished $(date -Is) ==="
+echo "Quality for phases 1-2 is unchanged and was NOT re-run; score any new arm with"
+echo "  python bench/guardrails.py --runs bench/results/night/<arm> --tag night_<arm> --strokes 16"

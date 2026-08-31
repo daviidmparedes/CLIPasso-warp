@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # Apples-to-apples: both sides at eval_interval=10, periodic logging off.
+# WARNING: this script's output paths are hardcoded and it OVERWRITES
+#          bench/results/baseline/patched_nolog and bench/results/batched.
+#          Those are live comparison arms (batched_freeze is the N1 control and
+#          one half of the n=15 noise floor). Re-run only when you intend to
+#          replace them; for a fresh timing pass use bench/run_night.sh, which
+#          writes everything under bench/results/night/.
 set -uo pipefail
 source /home/dmiranda/CLIPasso/.venv/bin/activate
 cd /home/dmiranda/CLIPasso

@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# WARNING: this script's output paths are hardcoded and it OVERWRITES
+#          bench/results/batched_freeze.
+#          Those are live comparison arms (batched_freeze is the N1 control and
+#          one half of the n=15 noise floor). Re-run only when you intend to
+#          replace them; for a fresh timing pass use bench/run_night.sh, which
+#          writes everything under bench/results/night/.
 set -uo pipefail
 source /home/dmiranda/CLIPasso/.venv/bin/activate
 cd /home/dmiranda/CLIPasso
