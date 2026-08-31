@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from scipy.ndimage.filters import gaussian_filter
+from scipy.ndimage import gaussian_filter  # [compat] scipy.ndimage.filters namespace removed in SciPy 2.0
 from skimage.color import rgb2gray
 from skimage.filters import threshold_otsu
 from torchvision import transforms
@@ -334,7 +334,7 @@ class Painter(torch.nn.Module):
         thresh[-1] = torch.Tensor(sum_attn)
 
         # sample num_paths from the chosen pixels.
-        prob_sum = sum_attn[self.inds[:,0].astype(np.int), self.inds[:,1].astype(np.int)]
+        prob_sum = sum_attn[self.inds[:,0].astype(int), self.inds[:,1].astype(int)]  # [compat] np.int removed in NumPy 1.24
         prob_sum = prob_sum / prob_sum.sum()
         new_inds = []
         for i in range(self.num_stages):

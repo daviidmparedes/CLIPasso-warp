@@ -13,7 +13,7 @@ from torch.nn import functional as F
 # We define this function as _pad because it takes an argument
 # named pad, which clobbers the recursive reference to the pad
 # function needed for __torch_function__ support
-pad = F._pad
+pad = F.pad  # [compat] F._pad was removed after torch 1.9; F.pad is the same op
 
 # This class exists solely for Transformer; it has an annotation stating
 # that bias is never None, which appeases TorchScript
@@ -247,7 +247,12 @@ def multi_head_attention_forward(query: Tensor,
     # use hooks for the attention weights if necessary
     if attention_probs_forward_hook is not None and attention_probs_backwards_hook is not None:
         attention_probs_forward_hook(attn_output_weights)
-        attn_output_weights.register_hook(attention_probs_backwards_hook)
+        # [compat] The saliency path (interpret()) needs this backward hook, but the
+        # same ViT is also used for plain inference under torch.no_grad(), where
+        # register_hook() raises on a tensor that does not require grad. Guarding on
+        # requires_grad keeps the saliency behaviour identical and unblocks no_grad use.
+        if attn_output_weights.requires_grad:
+            attn_output_weights.register_hook(attention_probs_backwards_hook)
 
     attn_output = torch.bmm(attn_output_weights, v)
     assert list(attn_output.size()) == [bsz * num_heads, tgt_len, head_dim]
