@@ -71,6 +71,10 @@ Findings from this work block, in the order they changed a decision:
    It still wins 1.10–1.50× by collapsing M−1 `cudaMalloc`/`cudaFree` cycles. (§4.5)
 9. **diffvg silently returns wrong output when the GPU is near its memory ceiling** — no
    exception, deterministically wrong numbers. Found by accident; now guarded. (§8, debt 1)
+10. **CLIPasso's learning rate never decays, and fixing that does not help.** `--lr_scheduler`
+   called a function that does not exist, so nothing ever settled. Implementing it works — 4.55×
+   less end-of-run wobble — but a decaying schedule **loses to plain truncation at every budget**
+   (+0.0065 at 1200, +0.0095 at 800). Not added to the ladder. (§4.6)
 
 
 Corrections to earlier claims, mine and the plan's, kept visible on purpose: an estimate that
@@ -319,6 +323,7 @@ Quality is **not** reported until the guardrails run. `n/a` means not yet measur
 | **1.2** | **Batch across images** (M=5 × 3 seeds) | **1.09×** — see §1.2 | +0.0046 | median rank 395→420 | **verified (mostly negative)** | `guardrails_tier12_M5_n16.json` |
 | 0.4 | **Strip diffvg's per-shape asserts** (`serialize_scene`) | 1.03× idle / 1.13× shared | **0 by construction** | **0 by construction** | **verified, opt-in** | `fast_serialize_n16*.json` |
 | 0.5 | **Tile M scenes onto one raster** | 1.10–1.50× on diffvg fwd+bwd (M ≥ 2) | n/a — not yet run end-to-end | n/a | prototype verified | `tiled_M*_n16_s2.json` |
+| N1 | **Learning-rate schedule** (the repo's missing `get_epoch_lr`) | none — loses to plain truncation at every budget | +0.0065 vs C0 @1200; +0.0095 @800 | 5-way 46.7→40.0% | **verified (negative)** | `n1_lr_verdict.json` |
 
 ### 0.1 / 0.3 — Freeze the CLIP encoder, and stop building the loss nobody uses
 
@@ -687,6 +692,90 @@ evaluated as a quality change against the n=15 floor before it is ever considere
 
 ---
 
+### 4.6 — A working learning-rate schedule (N1) — **negative for speed; the repo bug was real**
+
+`bash bench/run_lr_arms.sh` then `bash bench/run_lr_eval.sh` →
+`bench/results/lr_*`, `bench/results/quality_curve/n1_lr_verdict.json`
+
+`painterly_rendering.py:98` calls `optimizer.update_lr()`, which calls
+`utils.get_epoch_lr()` — **a function that does not exist anywhere in the repository**.
+`--lr_scheduler 1` has always raised `AttributeError`, so nothing has ever decayed the step
+size. With `lr = 1.0` and Adam, whose step magnitude is ~`lr` regardless of gradient scale,
+that is why §6 measures control points still moving at 0.19 px/iter after 1800 iterations.
+
+Implemented in `sketch_utils.get_epoch_lr()` (const / cosine / linear, optional warmup, decay
+horizon independent of run length), driven by four new `config.py` args, applied per iteration
+in `bench/batch_seeds.py` and recorded in every `config.npy`. **Defaults are unchanged** — with
+`--lr_scheduler 0` the function returns `args.lr` exactly, so every measurement above stands.
+
+#### The schedule does what it was supposed to do
+
+Over the last 10% of the run, with cosine decay to 0.05× (arm B) against the const-lr control:
+
+| | control | arm B | |
+|---|---:|---:|---:|
+| `loss_eval` sd, iterations 1800–2000 | 0.00386 | 0.00085 | **4.55× less wobble** |
+| mean step-to-step change, same window | 0.00250 | 0.00083 | 3.01× less |
+| `loss_eval` sd, iterations 1000–2000 | 0.00795 | 0.00345 | 2.30× less |
+
+The optimisation now settles instead of wandering, at Δ `loss_eval` = **−0.00101** — inside the
+0.00905 floor, so full-length decay is free.
+
+#### But it does not beat plain truncation, which is what it had to do
+
+§6 already established that truncating at 1200 is worth 1.67×. The schedule's job was to make
+that cheaper, so the comparison that matters is at **matched budget**:
+
+| configuration | `loss_eval` | Δ vs control | 5-way | margin | med rank | speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| control — const lr, 2001 | 0.55732 | — | 46.7% | +0.00244 | 395 | 1.00× |
+| B — cosine over 2001, full length | 0.55632 | −0.00101 | 46.7% | +0.00228 | 481 | 1.00× |
+| **C0 — const lr, 1200** | **0.55863** | **+0.00130** | **46.7%** | −0.00439 | 479 | **1.67×** |
+| B@1200 — cosine/2001, stopped at 1200 | 0.56156 | +0.00423 | — | — | — | 1.67× |
+| C — cosine compressed into 1200 | 0.56517 | +0.00785 | 40.0% | −0.00487 | 517 | 1.67× |
+| D0 — const lr, 800 | 0.57184 | **+0.01452** ✗ | 40.0% | −0.00396 | 550 | 2.50× |
+| D — cosine compressed into 800 | 0.58135 | **+0.02402** ✗ | 33.3% | −0.00611 | 532 | 2.50× |
+
+Paired, at matched budget: **C vs C0 = +0.00654 ± 0.01613** (t = +1.57, 6/15 runs better with
+decay), **B@1200 vs C0 = +0.00293 ± 0.01297** (t = +0.87, 9/15), and **D vs D0 = +0.00951**, which
+clears the floor outright — at 800 iterations decay is not merely no help, it is *worse*. Every
+comparison points the wrong way. **Plain truncation is the best configuration at every budget.**
+
+At 800 iterations both arms fall outside the noise floor with or without decay, confirming §6's
+compliance table from an independent direction. 1200 is the budget; 800 is too aggressive.
+
+The zero-shot column deserves a caveat rather than a reading: with **40% of 5-way decisions
+flipping between two identical runs** (§6), a 46.7% → 40.0% step is one sketch and carries no
+information. The continuous margin is the metric to read, and it moves −0.004 to −0.009 across
+every truncated arm — inside its 0.01242 floor, but consistently negative, which is what a real
+truncation cost looks like when the sample is too small to resolve it.
+
+Compressing the decay (arm C) is the worst of the three, which is the informative part: driving
+the LR to 0.05 by iteration 1200 freezes the sketch while §6 shows it is still genuinely
+improving. A schedule that decays has to decay *slowly* to avoid paying for the settling it buys.
+
+#### A correction, because the first analysis of this was wrong
+
+An intermediate analysis reported that decay makes truncation **1.62× cheaper** and collapses its
+variance 2.6×. That measured each arm's truncation cost *against its own endpoint* — a moving
+target. Arm B's endpoint is slightly better and its curve flatter, so stopping early costs less
+relative to itself, while in absolute terms B at 1200 is worse than C0 at 1200. The variance claim
+fails the same way: in-place sds were 0.00351 vs 0.00910, but the absolute sds are 0.03723 vs
+0.03709 — identical. **Only the matched-budget absolute comparison answers the question**, and it
+reverses the conclusion. Recorded because the ratio looked convincing and was not.
+
+#### What to keep
+
+The schedule is **not** added to the ladder. It is kept because the missing-function bug is real
+and worth fixing upstream, because full-length decay is free and may be worth having for its own
+sake, and because of one question it opens that is worth GPU time regardless of speed: **does
+settling shrink the 57.5 px run-to-run divergence?** That number is the noise floor every quality
+claim in this document is judged against, so halving it would make every future comparison more
+sensitive — worth more to the programme than a 1.1× speedup. `bench/run_lr_replicate.sh` produces
+the paired replicate needed to answer it; it is quality-only, so it does not need an idle GPU.
+
+---
+
 ## 5. Quality guardrails
 
 Metric #2 was re-specified: the paper's zero-shot `"A sketch of a(n) {class}"` is now available
@@ -945,53 +1034,19 @@ well short of the brief's ~5×. P2 was run and split the diffvg problem in two �
 that is now fixed (§4.4, §4.5) and a work half that is not (§2). Priorities below are re-derived
 from that, not carried over.
 
-### N1 — Give CLIPasso a working learning-rate schedule — **implemented, arms running**
+### N1 — ~~Learning-rate schedule~~ — **done, negative** (see §4.6)
 
-Status: `sketch_utils.get_epoch_lr()` is written (it did not exist), `config.py` gained
-`--lr_schedule / --lr_min_ratio / --lr_warmup / --lr_decay_iters`, and `bench/batch_seeds.py`
-applies the schedule per iteration and records the realised LR in every `config.npy`.
-**Defaults are unchanged**: with `--lr_scheduler 0` the function returns `args.lr` exactly, so
-the shipped behaviour — and every measurement above — is untouched.
+Implemented and measured over five arms. The schedule works — 4.55× less end-of-run wobble — and
+full-length decay is free, but it loses to plain truncation at every budget tested, so it does not
+join the ladder. The repo's missing `get_epoch_lr()` is fixed either way.
 
-Five arms are running via `bench/run_lr_arms.sh`, scored by `bench/run_lr_eval.sh`:
+One follow-up is still worth GPU time and does **not** need an idle card, because it reads only
+quality: `bash bench/run_lr_replicate.sh` produces a paired replicate of arm B so
+`bench/noise_floor.py` can answer whether settling shrinks the **57.5 px run-to-run divergence**.
+That number is the floor every quality claim here is judged against; halving it would make every
+future comparison more sensitive, which is worth more to the programme than a 1.1× speedup.
 
-| arm | iterations | schedule | asks |
-|---|---:|---|---|
-| control | 2001 | const (`batched_freeze`, already on disk) | — |
-| B | 2001 | cosine → 0.05 | does settling improve quality at *no* saving? |
-| C0 | 1200 | const | plain truncation at 1.67× (§6's recommendation) |
-| **C** | **1200** | **cosine → 0.05** | **does decay beat truncation at matched cost?** |
-| D0 | 800 | const | plain truncation at 2.5× |
-| D | 800 | cosine → 0.05 | same, deeper |
-
-C vs C0 and D vs D0 are the comparisons that decide N1; B answers whether the schedule earns
-its place even at full length. Speedups here are arithmetic (2001/1200), not measured — the GPU
-is shared, so only the quality half of each pair needs running.
-
-The motivation is §6's finding that **nothing in CLIPasso makes the optimisation converge**. `lr = 1.0` with Adam and no decay means the control points move at a constant
-~0.19 px/iter forever; the repo's own scheduler hook calls a function that does not exist.
-
-This is not itself a speed change, which is why it has no §4 entry — it is the multiplier on
-N2. Truncation currently costs quality because the run never settles; the sketch at iteration
-1200 is still moving as fast as it was at 200. A schedule that actually decays should let it
-settle, which would both push N2's budget below 1200 and shrink the 57.5 px replicate
-divergence that sets the floor every other quality claim is judged against.
-
-The order matters, and §6 constrains it: quality is still improving at iteration 1900, so a
-schedule that decays too early will cost real quality. Test in this order, each against the
-guardrails and the n=15 floor:
-
-1. Cosine decay over the full 2001 iterations — *same* budget, so this is purely a quality
-   test: does settling improve the final sketch and tighten the replicate floor (§4.3)?
-2. Only if that holds, compress: cosine decay over 1200, then 800 iterations, re-deriving
-   N2's compliance table each time rather than assuming 1200 still applies.
-3. Report the (speedup, quality delta) pair for each. A 2001→800 compression at equal quality
-   would be 2.5×, and unlike raw truncation it would be earned rather than taken.
-
-**Also fix or delete `--lr_scheduler`.** As shipped, the flag crashes. That is worth a
-one-line upstream issue regardless of what we do with it.
-
-### N2 — Implement 2.1 as a fixed, stroke-count-dependent budget (1.67×, already validated)
+### N2 — Implement 2.1 as a fixed, stroke-count-dependent budget (1.67×) — **now the top item**
 
 §6 did the validation, so this is implementation only. Stop at **1200 iterations**, which keeps
 96% of runs at or above the n=15 reproducibility floor, and scale with stroke count — the floor
@@ -999,9 +1054,9 @@ is reached at 180 / 400 / 800 iterations for n=8 / 16 / 32, so a single constant
 cheap cases. Do **not** implement it as an adaptive rule: at matched cost every velocity
 threshold tested scored +0 points against a fixed cut, because nothing decays (N1).
 
-Sequencing note: N1 changes the trajectory, so the 1200 figure has to be re-derived afterwards.
-If a decaying schedule makes runs settle, the budget should fall further — which is the whole
-argument for doing N1 first rather than banking 1.67× now and re-doing it later.
+Sequencing note, now resolved: this was queued behind N1 on the theory that a settled run would
+truncate more cheaply and push the budget below 1200. N1 measured that and it is false — decay
+does not beat plain truncation (§4.6). So 1200 stands, and this is ready to implement as-is.
 
 ### N3 — Land 0.4, and integrate tiling into the batched harnesses
 
