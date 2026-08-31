@@ -1,3 +1,12 @@
 __pycache__/
+*.pyc
+
+# created by setup.sh
+.venv/
+third_party/
+
+# downloaded on first run (about 170 MB)
+U2Net_/saved_models/
+
+# sketches you generate
 output_sketches/
-U2Net_/
