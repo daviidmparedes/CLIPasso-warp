@@ -899,6 +899,53 @@ many runs each guardrail needs to detect a given effect.
 
 ---
 
+### The eval set was not just small, it was unrepresentative
+
+`bash bench/run_wide_evalset.sh` then `guardrails.py --runs bench/results/wide1200` →
+`bench/results/guardrails/guardrails_wide1200.json`
+
+§6's power table said 15 runs resolve about 50% of each perceptual metric's signal and that
+`data/paper_protocol.json` (200 images, 10 categories) would take that to about 20%. That job
+has now run: 200 sketches at n=16, one seed each, at the **1200-iteration budget §6 recommends**,
+so it widens the sample and validates that budget at 40× the previous sample size in one pass.
+237.9 minutes on a shared card.
+
+| | 5-image set (n=15, 2001 iters) | paper protocol (n=200, 1200 iters) |
+|---|---:|---:|
+| `loss_eval` | 0.55732 ± 0.03967 | 0.53813 ± 0.04684 |
+| zero-shot top-1, 125-way | 13.3% | **29.0%** |
+| zero-shot top-1, subset | 46.7% (5-way) | 49.5% (10-way) |
+| retrieval R@1 | 0.0% | **1.5%** |
+| retrieval R@10 | 0.0% | 5.5% |
+| retrieval median rank | 395 / 2000 | 418 / 2166 |
+| zero-shot margin, sem | ±0.00382 | **±0.00162** |
+| sim to true photo, sem | ±0.00876 | **±0.00499** |
+
+The standard errors tighten by roughly 2.4×, as predicted, and **R@1 finally comes off its floor**
+— on the small set it was pinned at 0.0%, which is a metric that cannot report anything.
+
+The unexpected part is the accuracy column. The wide set scores more than twice as well on
+125-way zero-shot *while running a shorter budget*. A shorter budget cannot explain a higher
+score, so the difference is the images: **the five-image set was not merely imprecise, it was
+unrepresentative**, and it understated how recognisable CLIPasso's sketches actually are.
+
+This does not invalidate §4. Those deltas were paired within the same sample, so a bias shared by
+both arms cancels, and "inside the noise floor" still holds. What it does invalidate is any
+absolute reading of the recognisability numbers in §5 — including the comparison against the
+paper's ~78% at 16 strokes, which was being made against an unlucky five-image draw.
+
+Against the paper protocol proper we get 29.0% on a 125-way label space and 49.5% on the 10-way
+one. Still well short of the paper's ~78%, and the remaining gap is now a real question rather
+than a sampling artefact: our label space is harder than theirs (125 Sketchy classes, not 10),
+and our prompt and gallery construction differ. Worth resolving before any of these numbers are
+quoted anywhere.
+
+**Methodology debt item 4 is closed.** `bench/results/wide1200` is the set future quality claims
+should use; the five-image set stays useful only for `loss_eval`, which is unaffected by the
+sampling problem because it is not a recognition metric.
+
+---
+
 ## 6. Early stopping (brief idea 2.1): worth ~1.7×, not ~5×
 
 `python bench/quality_vs_iter.py --runs bench/results/baseline/shipped --tag shipped`
@@ -1213,7 +1260,8 @@ resolving ~50% of the signal to ~20%.
 3. ~~**Widen the nondeterminism control**~~ — **done this block**, n=3 → n=15
    (`bench/run_replicate_control.sh`). It was worth doing: the floor moved from 0.9516 to 0.9368
    and the early-stopping verdict moved by 1.6× (§6).
-4. **Eval-set width, now quantified rather than asserted** — the power table in §6 says 15 runs
-   resolve ~50% of the perceptual signal and `paper_protocol.json` (200 images) would resolve
-   ~20%. That is the number to weigh against ~2 GPU-hours of runs.
+4. ~~**Eval-set width**~~ — **done**. 200 images run at the 1200-iteration budget (§5). The
+   standard errors tightened ~2.4× and R@1 came off its floor, but the headline finding was that
+   the small set was *unrepresentative*, not just imprecise: 125-way zero-shot is 29.0% on the
+   wide set against 13.3% on the small one, at a shorter budget.
 5. **Decide the §4 question.** N1–N4 do not depend on it, but the research tier does.
